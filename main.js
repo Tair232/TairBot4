@@ -109,6 +109,7 @@ const player = {
   preloadTitle: null,
   preloadLabel: null,
   preloadTimerText: null,
+  lateJoinSkipButton: null,
 
   lateJoinActive: false,
   lateJoinStarted: false,
@@ -253,6 +254,7 @@ function destroyPlayer() {
   player.preloadTitle = null;
   player.preloadLabel = null;
   player.preloadTimerText = null;
+  player.lateJoinSkipButton = null;
 
   player.lateJoinActive = false;
   player.lateJoinStarted = false;
@@ -341,6 +343,15 @@ function renderMovie(state) {
             <span id="preloadLabel">Общий старт через</span>
             <b id="preloadTimerText">1:00</b>
           </span>
+
+          <button
+            id="lateJoinSkipButton"
+            class="late-join-skip"
+            type="button"
+            hidden
+          >
+            Смотреть сейчас
+          </button>
         </div>
       </div>
 
@@ -382,6 +393,7 @@ function renderMovie(state) {
   player.preloadTitle = document.querySelector("#preloadTitle");
   player.preloadLabel = document.querySelector("#preloadLabel");
   player.preloadTimerText = document.querySelector("#preloadTimerText");
+  player.lateJoinSkipButton = document.querySelector("#lateJoinSkipButton");
 
   player.volumeHud = document.querySelector("#volumeHud");
   player.volumeButton = document.querySelector("#volumeButton");
@@ -389,6 +401,11 @@ function renderMovie(state) {
 
   setupVolumeControls();
   configureLateJoinIfNeeded(state, key);
+
+  if (player.lateJoinSkipButton) {
+    player.lateJoinSkipButton.onclick = skipLateJoinWait;
+  }
+
   updatePreloadOverlay(state);
 
   player.tap.onclick = handleUserPlayGesture;
@@ -591,6 +608,59 @@ function lateJoinSecondsLeft() {
       (player.lateJoinTargetServerTime - serverNowMs()) / 1000
     )
   );
+}
+
+function skipLateJoinWait() {
+  if (
+    !player.video ||
+    !currentState?.movie ||
+    !player.lateJoinActive ||
+    player.lateJoinStarted
+  ) {
+    return;
+  }
+
+  const video = player.video;
+  let target = serverPosition(currentState);
+
+  if (Number.isFinite(video.duration) && video.duration > 0) {
+    target = Math.min(
+      target,
+      Math.max(0, video.duration - 0.2)
+    );
+  }
+
+  console.log(
+    `[LATE JOIN] user skipped preload -> room position ${target.toFixed(2)}s`
+  );
+
+  // This affects only this Activity instance.
+  // The authoritative backend timeline and all other viewers remain untouched.
+  player.lateJoinStarted = true;
+  player.lateJoinActive = false;
+  player.lateJoinTargetPosition = null;
+  player.lateJoinTargetServerTime = null;
+  player.firstFrameSeen = false;
+  player.buffering = false;
+
+  if (player.lateJoinSkipButton) {
+    player.lateJoinSkipButton.disabled = true;
+  }
+
+  updatePreloadOverlay(currentState);
+
+  // Even if this point is not already buffered, the user's explicit action
+  // means "join now", so intentionally perform the seek and let the browser
+  // buffer the current room position.
+  if (player.loaded && video.readyState >= 1) {
+    try {
+      video.currentTime = target;
+    } catch {}
+
+    hideLoader();
+    emitPlaybackProgress();
+    requestPlayback();
+  }
 }
 
 function setupVolumeControls() {
@@ -990,7 +1060,17 @@ function updatePreloadOverlay(state) {
       player.preloadTimerText.textContent = fmt(lateJoinSecondsLeft());
     }
 
+    if (player.lateJoinSkipButton) {
+      player.lateJoinSkipButton.hidden = false;
+      player.lateJoinSkipButton.disabled = false;
+    }
+
     return;
+  }
+
+  if (player.lateJoinSkipButton) {
+    player.lateJoinSkipButton.hidden = true;
+    player.lateJoinSkipButton.disabled = false;
   }
 
   const active =
