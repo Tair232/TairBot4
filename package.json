@@ -1,7 +1,7 @@
 {
-  "name": "movie-night-v9-22-kodikplayer-fix",
+  "name": "movie-night-v9-24-kodik-iframe-bridge",
   "private": true,
-  "version": "2.0.22",
+  "version": "2.0.24",
   "type": "module",
   "scripts": {
     "build": "vite build",
