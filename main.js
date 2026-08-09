@@ -1,0 +1,1685 @@
+import { DiscordSDK } from "@discord/embedded-app-sdk";
+import { io } from "socket.io-client";
+import "./style.css";
+
+const CLIENT_ID = "1535948196663009321";
+const ALLOWED_GUILD_ID = "1492151172570808390";
+
+const app = document.querySelector("#app");
+const discordSdk = new DiscordSDK(CLIENT_ID);
+
+let socket = null;
+let currentState = null;
+
+let serverClockOffsetMs = 0;
+let serverClockReady = false;
+let clockSyncInterval = null;
+let firstSessionState = true;
+let lateJoinCandidateKey = null;
+
+function serverNowMs() {
+  return Date.now() + serverClockOffsetMs;
+}
+
+function absorbStateClock(state) {
+  if (
+    serverClockReady ||
+    !Number.isFinite(Number(state?.serverNow))
+  ) {
+    return;
+  }
+
+  // Initial coarse estimate until the RTT-based sync completes.
+  serverClockOffsetMs = Number(state.serverNow) - Date.now();
+}
+
+async function syncServerClock() {
+  if (!socket?.connected) return;
+
+  const samples = [];
+
+  for (let i = 0; i < 5; i++) {
+    const sample = await new Promise((resolve) => {
+      const t0 = Date.now();
+
+      socket.timeout(2000).emit(
+        "time:sync",
+        { clientSentAt: t0 },
+        (error, reply) => {
+          const t1 = Date.now();
+
+          if (error || !Number.isFinite(Number(reply?.serverNow))) {
+            resolve(null);
+            return;
+          }
+
+          const rtt = t1 - t0;
+          const midpoint = (t0 + t1) / 2;
+          const offset = Number(reply.serverNow) - midpoint;
+
+          resolve({ rtt, offset });
+        }
+      );
+    });
+
+    if (sample) samples.push(sample);
+    await new Promise((resolve) => setTimeout(resolve, 70));
+  }
+
+  if (!samples.length) return;
+
+  // Lowest RTT sample is least distorted by network delay.
+  samples.sort((a, b) => a.rtt - b.rtt);
+  const best = samples[0];
+
+  serverClockOffsetMs = best.offset;
+  serverClockReady = true;
+
+  console.log(
+    `[CLOCK] server offset=${serverClockOffsetMs.toFixed(1)}ms rtt=${best.rtt}ms`
+  );
+}
+
+// One player object for one movie. We do not constantly recreate <video>.
+const player = {
+  key: null,
+  video: null,
+  tap: null,
+  loader: null,
+  loaderText: null,
+  errorBox: null,
+  errorText: null,
+
+  loadGeneration: 0,
+  loading: false,
+  loaded: false,
+  qualities: [],
+  qualityIndex: -1,
+
+  retryTimer: null,
+  syncTimer: null,
+  playWatchdog: null,
+  playAttemptPending: false,
+
+  firstFrameSeen: false,
+  buffering: false,
+  lastProgressLogAt: 0,
+
+  preloadOverlay: null,
+  preloadTitle: null,
+  preloadLabel: null,
+  preloadTimerText: null,
+
+  lateJoinActive: false,
+  lateJoinStarted: false,
+  lateJoinTargetPosition: null,
+  lateJoinTargetServerTime: null,
+
+  volumeHud: null,
+  volumeButton: null,
+  volumeSlider: null,
+  volumeHideTimer: null,
+};
+
+function esc(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function fmt(seconds) {
+  seconds = Math.max(0, Math.floor(Number(seconds) || 0));
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+
+  return h
+    ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+    : `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function movieKey(movie) {
+  return movie ? `${movie.oid}_${movie.id}_${movie.hash || ""}` : "";
+}
+
+function globalPreloadExpired(state) {
+  return Boolean(
+    state?.phase === "PAUSED" &&
+    state?.autoStartAt &&
+    serverNowMs() >= Number(state.autoStartAt)
+  );
+}
+
+function wantsPlayback(state) {
+  return Boolean(
+    state?.phase === "WATCHING" ||
+    globalPreloadExpired(state)
+  );
+}
+
+function serverPosition(state) {
+  if (!state?.movie) return 0;
+
+  const base = Math.max(0, Number(state.positionSeconds) || 0);
+
+  if (state.phase === "WATCHING" && state.startedAt) {
+    return (
+      base +
+      Math.max(0, serverNowMs() - Number(state.startedAt)) / 1000
+    );
+  }
+
+  // All clients can begin at the exact scheduled backend timestamp even if
+  // the WATCHING broadcast arrives a few milliseconds later.
+  if (
+    state.phase === "PAUSED" &&
+    state.autoStartAt &&
+    serverNowMs() >= Number(state.autoStartAt)
+  ) {
+    return Math.max(
+      0,
+      (serverNowMs() - Number(state.autoStartAt)) / 1000
+    );
+  }
+
+  return base;
+}
+
+function renderBoot(text) {
+  app.innerHTML = `
+    <main class="screen simple-screen">
+      <div class="boot-text">${esc(text)}</div>
+    </main>
+  `;
+}
+
+function renderFatal(title, detail = "") {
+  destroyPlayer();
+
+  app.innerHTML = `
+    <main class="screen simple-screen">
+      <div class="fatal">
+        <strong>${esc(title)}</strong>
+        ${detail ? `<span>${esc(detail)}</span>` : ""}
+      </div>
+    </main>
+  `;
+}
+
+function renderIdle() {
+  destroyPlayer();
+  app.innerHTML = `<main class="screen movie-black"></main>`;
+}
+
+function destroyPlayer() {
+  player.loadGeneration += 1;
+
+  clearTimeout(player.retryTimer);
+  clearTimeout(player.playWatchdog);
+  clearTimeout(player.volumeHideTimer);
+  clearInterval(player.syncTimer);
+
+  player.retryTimer = null;
+  player.playWatchdog = null;
+  player.syncTimer = null;
+  player.playAttemptPending = false;
+
+  if (player.video) {
+    try {
+      player.video.pause();
+      player.video.removeAttribute("src");
+      player.video.load();
+    } catch {}
+  }
+
+  player.key = null;
+  player.video = null;
+  player.tap = null;
+  player.loader = null;
+  player.loaderText = null;
+  player.errorBox = null;
+  player.errorText = null;
+
+  player.loading = false;
+  player.loaded = false;
+  player.qualities = [];
+  player.qualityIndex = -1;
+  player.firstFrameSeen = false;
+  player.buffering = false;
+  player.lastProgressLogAt = 0;
+  player.preloadOverlay = null;
+  player.preloadTitle = null;
+  player.preloadLabel = null;
+  player.preloadTimerText = null;
+
+  player.lateJoinActive = false;
+  player.lateJoinStarted = false;
+  player.lateJoinTargetPosition = null;
+  player.lateJoinTargetServerTime = null;
+
+  player.volumeHud = null;
+  player.volumeButton = null;
+  player.volumeSlider = null;
+  player.volumeHideTimer = null;
+}
+
+function setLoader(text) {
+  if (player.loaderText) player.loaderText.textContent = text;
+  if (player.loader) player.loader.hidden = false;
+  if (player.errorBox) player.errorBox.hidden = true;
+}
+
+function hideLoader() {
+  if (player.loader) player.loader.hidden = true;
+}
+
+function showError(text) {
+  hideLoader();
+
+  if (player.errorText) player.errorText.textContent = text;
+  if (player.errorBox) player.errorBox.hidden = false;
+}
+
+function hideError() {
+  if (player.errorBox) player.errorBox.hidden = true;
+}
+
+function showTap() {
+  hideLoader();
+  hideError();
+
+  if (!player.tap) return;
+
+  player.tap.disabled = false;
+  player.tap.textContent = "▶ Нажмите, чтобы начать просмотр";
+  player.tap.hidden = false;
+}
+
+function hideTap() {
+  if (!player.tap) return;
+
+  player.tap.hidden = true;
+  player.tap.disabled = false;
+  player.tap.textContent = "▶ Нажмите, чтобы начать просмотр";
+}
+
+function renderMovie(state) {
+  const key = movieKey(state.movie);
+
+  if (player.video && player.key === key) {
+    updatePreloadOverlay(state);
+
+    // Server broadcasts state repeatedly. Never force-seek on every packet.
+    applyHostState(false);
+    return;
+  }
+
+  destroyPlayer();
+
+  app.innerHTML = `
+    <main class="screen movie-screen">
+      <video
+        id="movieVideo"
+        playsinline
+        preload="auto"
+        disablepictureinpicture
+      ></video>
+
+      <div id="movieLoader" class="movie-loader">
+        <div class="loader-inner">
+          <div class="spinner"></div>
+          <span id="movieLoaderText">Загрузка фильма…</span>
+        </div>
+      </div>
+
+      <div id="preloadOverlay" class="preload-overlay" hidden>
+        <div class="preload-card">
+          <strong id="preloadTitle">Предзагрузка фильма</strong>
+          <span>
+            <span id="preloadLabel">Общий старт через</span>
+            <b id="preloadTimerText">1:00</b>
+          </span>
+        </div>
+      </div>
+
+      <div id="volumeHud" class="volume-hud">
+        <button id="volumeButton" class="volume-button" type="button" aria-label="Звук">
+          🔊
+        </button>
+        <input
+          id="volumeSlider"
+          class="volume-slider"
+          type="range"
+          min="0"
+          max="100"
+          step="1"
+          value="100"
+          aria-label="Громкость"
+        />
+      </div>
+
+      <button id="tapToPlay" class="tap-to-play" hidden>
+        ▶ Нажмите, чтобы начать просмотр
+      </button>
+
+      <div id="movieError" class="movie-error" hidden>
+        <strong>Не удалось загрузить видео</strong>
+        <span id="movieErrorText">Повторяю попытку…</span>
+      </div>
+    </main>
+  `;
+
+  player.key = key;
+  player.video = document.querySelector("#movieVideo");
+  player.tap = document.querySelector("#tapToPlay");
+  player.loader = document.querySelector("#movieLoader");
+  player.loaderText = document.querySelector("#movieLoaderText");
+  player.errorBox = document.querySelector("#movieError");
+  player.errorText = document.querySelector("#movieErrorText");
+  player.preloadOverlay = document.querySelector("#preloadOverlay");
+  player.preloadTitle = document.querySelector("#preloadTitle");
+  player.preloadLabel = document.querySelector("#preloadLabel");
+  player.preloadTimerText = document.querySelector("#preloadTimerText");
+
+  player.volumeHud = document.querySelector("#volumeHud");
+  player.volumeButton = document.querySelector("#volumeButton");
+  player.volumeSlider = document.querySelector("#volumeSlider");
+
+  setupVolumeControls();
+  configureLateJoinIfNeeded(state, key);
+  updatePreloadOverlay(state);
+
+  player.tap.onclick = handleUserPlayGesture;
+
+  player.video.addEventListener("loadedmetadata", () => {
+    if (!isCurrentMovie(key)) return;
+
+    const duration = Number(player.video.duration);
+
+    console.log(
+      `[PLAYER] metadata ${player.video.videoWidth}x${player.video.videoHeight}, duration=${duration}`
+    );
+
+    if (Number.isFinite(duration) && duration > 0) {
+      socket?.emit("movie:metadata", {
+        movieKey: key,
+        duration,
+      });
+    }
+
+    seekToHost(true);
+
+    // Metadata is enough to know the source is valid.
+    // Do not leave "Загрузка..." waiting for play().
+    hideLoader();
+
+    if (currentState?.phase === "PAUSED") {
+      player.video.pause();
+      return;
+    }
+
+    requestPlayback();
+  });
+
+  player.video.addEventListener("loadeddata", () => {
+    if (!isCurrentMovie(key)) return;
+    hideLoader();
+    applyHostState(false);
+  });
+
+  player.video.addEventListener("canplay", () => {
+    if (!isCurrentMovie(key)) return;
+    hideLoader();
+    applyHostState(false);
+  });
+
+  player.video.addEventListener("playing", () => {
+    if (!isCurrentMovie(key)) return;
+
+    player.firstFrameSeen = true;
+    player.buffering = false;
+    player.playAttemptPending = false;
+    clearTimeout(player.playWatchdog);
+    player.playWatchdog = null;
+
+    hideLoader();
+    hideError();
+    hideTap();
+    updatePreloadOverlay(currentState);
+
+    console.log(
+      `[PLAYER] playing quality=${qualityNumber(player.qualities[player.qualityIndex]?.key)}p`
+    );
+
+    emitPlaybackProgress();
+
+    // Do NOT seek on the first playing frame.
+    // Let sequential playback establish itself first.
+  });
+
+  player.video.addEventListener("waiting", () => {
+    if (!isCurrentMovie(key)) return;
+    player.buffering = true;
+    console.log(
+      `[PLAYER] waiting at ${player.video.currentTime.toFixed(2)}s, bufferedAhead=${bufferedAhead(player.video).toFixed(2)}s`
+    );
+    emitPlaybackProgress();
+  });
+
+  player.video.addEventListener("stalled", () => {
+    if (!isCurrentMovie(key)) return;
+    player.buffering = true;
+    console.log(
+      `[PLAYER] stalled at ${player.video.currentTime.toFixed(2)}s, bufferedAhead=${bufferedAhead(player.video).toFixed(2)}s`
+    );
+    emitPlaybackProgress();
+  });
+
+  player.video.addEventListener("canplay", () => {
+    if (!isCurrentMovie(key)) return;
+    player.buffering = false;
+  });
+
+  player.video.addEventListener("progress", () => {
+    if (!isCurrentMovie(key)) return;
+
+    const now = Date.now();
+    if (now - player.lastProgressLogAt < 5000) return;
+    player.lastProgressLogAt = now;
+
+    console.log(
+      `[PLAYER] buffer ${bufferedAhead(player.video).toFixed(1)}s ahead @ ${player.video.currentTime.toFixed(1)}s`
+    );
+  });
+
+  player.video.addEventListener("pause", () => {
+    if (!isCurrentMovie(key)) return;
+
+    if (wantsPlayback(currentState) && !player.video.ended) {
+      // If the browser paused us unexpectedly, host sync will try again.
+      setTimeout(() => {
+        if (isCurrentMovie(key)) applyHostState(false);
+      }, 300);
+    }
+  });
+
+  player.video.addEventListener("ended", () => {
+    if (!isCurrentMovie(key)) return;
+    emitPlaybackProgress(true);
+    socket?.emit("movie:ended", { movieKey: key });
+  });
+
+  player.video.addEventListener("error", () => {
+    if (!isCurrentMovie(key)) return;
+
+    const error = player.video.error;
+    console.error("[PLAYER] media error:", error);
+
+    // Signed VK links can fail/expire. Refetch fresh VK metadata.
+    retryFreshMovieSource(
+      `Ошибка потока ${error?.code || "?"}`
+    );
+  });
+
+  loadFreshMovieSource(state.movie, key);
+
+  player.syncTimer = setInterval(() => {
+    updatePreloadOverlay(currentState);
+    applyHostState(false);
+    emitPlaybackProgress();
+  }, 1000);
+}
+
+function isCurrentMovie(key) {
+  return Boolean(
+    player.video &&
+    player.key === key &&
+    currentState?.movie &&
+    movieKey(currentState.movie) === key
+  );
+}
+
+
+function configureLateJoinIfNeeded(state, key) {
+  if (lateJoinCandidateKey !== key) return;
+  if (state?.phase !== "WATCHING" || !state?.startedAt) return;
+
+  const current = serverPosition(state);
+
+  // A join at the first few seconds is effectively an on-time viewer.
+  if (current < 5) return;
+
+  const preloadSeconds = Math.max(
+    30,
+    Number(state.lateJoinPreloadSeconds) || 180
+  );
+
+  let target = current + preloadSeconds;
+
+  if (Number.isFinite(Number(state.movie?.duration))) {
+    target = Math.min(
+      target,
+      Math.max(current + 1, Number(state.movie.duration) - 2)
+    );
+  }
+
+  player.lateJoinActive = true;
+  player.lateJoinStarted = false;
+  player.lateJoinTargetPosition = target;
+
+  // Convert target movie position to authoritative server wall-clock time.
+  const base = Math.max(0, Number(state.positionSeconds) || 0);
+  player.lateJoinTargetServerTime =
+    Number(state.startedAt) + Math.max(0, target - base) * 1000;
+
+  console.log(
+    `[LATE JOIN] current=${current.toFixed(1)} target=${target.toFixed(1)} wait=${Math.max(
+      0,
+      (player.lateJoinTargetServerTime - serverNowMs()) / 1000
+    ).toFixed(1)}s`
+  );
+}
+
+function lateJoinSecondsLeft() {
+  if (!player.lateJoinActive || !player.lateJoinTargetServerTime) return 0;
+
+  return Math.max(
+    0,
+    Math.ceil(
+      (player.lateJoinTargetServerTime - serverNowMs()) / 1000
+    )
+  );
+}
+
+function setupVolumeControls() {
+  const video = player.video;
+  const hud = player.volumeHud;
+  const button = player.volumeButton;
+  const slider = player.volumeSlider;
+  const screen = document.querySelector(".movie-screen");
+
+  if (!video || !hud || !button || !slider || !screen) return;
+
+  let savedVolume = 1;
+
+  try {
+    const raw = localStorage.getItem("movieNightVolume");
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed)) {
+      savedVolume = Math.min(1, Math.max(0, parsed));
+    }
+  } catch {}
+
+  video.volume = savedVolume;
+  video.muted = savedVolume <= 0;
+
+  slider.value = String(Math.round(savedVolume * 100));
+
+  const refreshIcon = () => {
+    if (video.muted || video.volume <= 0.001) {
+      button.textContent = "🔇";
+    } else if (video.volume < 0.5) {
+      button.textContent = "🔉";
+    } else {
+      button.textContent = "🔊";
+    }
+  };
+
+  const showHud = () => {
+    hud.classList.add("visible");
+
+    clearTimeout(player.volumeHideTimer);
+    player.volumeHideTimer = setTimeout(() => {
+      hud.classList.remove("visible");
+    }, 1800);
+  };
+
+  slider.addEventListener("input", () => {
+    const value = Math.min(
+      1,
+      Math.max(0, Number(slider.value) / 100)
+    );
+
+    video.volume = value;
+    video.muted = value <= 0;
+
+    try {
+      localStorage.setItem("movieNightVolume", String(value));
+    } catch {}
+
+    refreshIcon();
+    showHud();
+  });
+
+  button.addEventListener("click", () => {
+    if (video.muted || video.volume <= 0.001) {
+      const fallback =
+        Number(slider.value) > 0
+          ? Number(slider.value) / 100
+          : 0.75;
+
+      video.volume = fallback;
+      video.muted = false;
+      slider.value = String(Math.round(fallback * 100));
+    } else {
+      video.muted = true;
+    }
+
+    refreshIcon();
+    showHud();
+  });
+
+  screen.addEventListener("mousemove", showHud, { passive: true });
+  screen.addEventListener("touchstart", showHud, { passive: true });
+  hud.addEventListener("mouseenter", showHud);
+
+  refreshIcon();
+}
+
+function emitPlaybackProgress(forceEnded = false) {
+  if (!socket?.connected || !player.video || !currentState?.movie) return;
+  if (movieKey(currentState.movie) !== player.key) return;
+
+  const participating =
+    !player.lateJoinActive || player.lateJoinStarted;
+
+  socket.emit("playback:progress", {
+    movieKey: player.key,
+    currentTime: Number(player.video.currentTime) || 0,
+    duration: Number.isFinite(player.video.duration)
+      ? player.video.duration
+      : currentState.movie.duration || null,
+    ended: forceEnded || player.video.ended,
+    buffering: player.buffering,
+    loaded: player.loaded,
+    participating,
+    lateJoin: player.lateJoinActive,
+  });
+}
+
+/* ---------------- VK PLAYER CORE (kept intentionally close to V6/V7) ---------------- */
+
+function vkEmbedPath(movie) {
+  const params = new URLSearchParams({
+    oid: movie.oid,
+    id: movie.id,
+    hd: "4",
+    autoplay: "0",
+    js_api: "1",
+  });
+
+  if (movie.hash) params.set("hash", movie.hash);
+
+  return `/vk/video_ext.php?${params}`;
+}
+
+function decodeVkUrl(value) {
+  return value
+    .replaceAll("\\/", "/")
+    .replaceAll("\\u0026", "&")
+    .replaceAll("&amp;", "&");
+}
+
+function extractMp4Files(html) {
+  const files = {};
+
+  for (const q of ["144", "240", "360", "480", "720", "1080", "1440", "2160"]) {
+    const match = html.match(
+      new RegExp(`"mp4_${q}"\\s*:\\s*"([^"]+)"`, "i")
+    );
+
+    if (match) {
+      files[`mp4_${q}`] = decodeVkUrl(match[1]);
+    }
+  }
+
+  return files;
+}
+
+function qualityNumber(key) {
+  return Number(String(key || "").replace("mp4_", "")) || 0;
+}
+
+function qualityOrder(files) {
+  // This mirrors the old working player: prefer 1080, then 720.
+  // Higher-than-1080 streams are intentionally not preferred for Discord.
+  const order = [1080, 720, 480, 360, 240, 144, 1440, 2160];
+  const result = [];
+
+  for (const q of order) {
+    const key = `mp4_${q}`;
+    if (files[key]) result.push({ key, url: files[key] });
+  }
+
+  return result;
+}
+
+function mappedMediaUrl(original) {
+  const url = new URL(original);
+  const host = url.hostname.toLowerCase();
+
+  if (host.endsWith(".okcdn.ru")) {
+    const subdomain = host.slice(0, -".okcdn.ru".length);
+
+    if (!subdomain) {
+      throw new Error("Пустой OKCDN subdomain");
+    }
+
+    return `/vkmedia/${encodeURIComponent(subdomain)}${url.pathname}${url.search}${url.hash}`;
+  }
+
+  if (host.endsWith(".vkuser.net")) {
+    const subdomain = host.slice(0, -".vkuser.net".length);
+
+    if (!subdomain) {
+      throw new Error("Пустой VKUSER subdomain");
+    }
+
+    return `/vkuser/${encodeURIComponent(subdomain)}${url.pathname}${url.search}${url.hash}`;
+  }
+
+  throw new Error(`Неподдерживаемый VK CDN: ${url.hostname}`);
+}
+
+function waitForMetadata(video, timeoutMs, generation) {
+  return new Promise((resolve, reject) => {
+    let finished = false;
+
+    const finish = (fn, value) => {
+      if (finished) return;
+      finished = true;
+
+      clearTimeout(timer);
+      video.removeEventListener("loadedmetadata", onMetadata);
+      video.removeEventListener("error", onError);
+
+      fn(value);
+    };
+
+    const onMetadata = () => finish(resolve);
+
+    const onError = () => {
+      finish(
+        reject,
+        new Error(`VIDEO ERROR ${video.error?.code || "?"}`)
+      );
+    };
+
+    const timer = setTimeout(() => {
+      if (generation !== player.loadGeneration) {
+        finish(reject, new Error("stale load"));
+        return;
+      }
+
+      if (video.readyState >= 1) {
+        finish(resolve);
+      } else {
+        finish(reject, new Error("metadata timeout"));
+      }
+    }, timeoutMs);
+
+    // Listener is armed BEFORE src assignment.
+    video.addEventListener("loadedmetadata", onMetadata, { once: true });
+    video.addEventListener("error", onError, { once: true });
+
+    if (video.readyState >= 1) {
+      finish(resolve);
+    }
+  });
+}
+
+async function loadFreshMovieSource(movie, key) {
+  if (!isCurrentMovie(key) || player.loading) return;
+
+  player.loading = true;
+  player.loaded = false;
+  player.firstFrameSeen = false;
+
+  const generation = ++player.loadGeneration;
+
+  clearTimeout(player.retryTimer);
+  player.retryTimer = null;
+
+  setLoader("Получаю видео VK…");
+
+  try {
+    const response = await fetch(vkEmbedPath(movie), {
+      cache: "no-store",
+      credentials: "omit",
+    });
+
+    if (generation !== player.loadGeneration || !isCurrentMovie(key)) return;
+
+    const html = await response.text();
+
+    if (!response.ok) {
+      throw new Error(`VK HTTP ${response.status}`);
+    }
+
+    const files = extractMp4Files(html);
+    player.qualities = qualityOrder(files);
+
+    if (!player.qualities.length) {
+      throw new Error("VK не отдал MP4");
+    }
+
+    let lastError = null;
+
+    for (let i = 0; i < player.qualities.length; i++) {
+      if (generation !== player.loadGeneration || !isCurrentMovie(key)) return;
+
+      const quality = player.qualities[i];
+
+      try {
+        setLoader(`Загрузка ${qualityNumber(quality.key)}p…`);
+
+        const video = player.video;
+
+        try {
+          video.pause();
+          video.removeAttribute("src");
+          video.load();
+        } catch {}
+
+        const metadataPromise = waitForMetadata(video, 18_000, generation);
+
+        video.src = mappedMediaUrl(quality.url);
+        video.load();
+
+        await metadataPromise;
+
+        if (generation !== player.loadGeneration || !isCurrentMovie(key)) return;
+
+        player.qualityIndex = i;
+        player.loaded = true;
+        player.loading = false;
+
+        console.log(
+          `[PLAYER] selected ${qualityNumber(quality.key)}p, readyState=${video.readyState}`
+        );
+
+        // Critical difference from V8.x:
+        // success means "source loaded". We do NOT await play() here.
+        hideLoader();
+        seekToHost(true);
+        applyHostState(true);
+        return;
+      } catch (error) {
+        lastError = error;
+        console.warn(
+          `[PLAYER] ${qualityNumber(quality.key)}p failed:`,
+          error?.message || error
+        );
+      }
+    }
+
+    throw lastError || new Error("Все качества VK недоступны");
+  } catch (error) {
+    if (generation !== player.loadGeneration || !isCurrentMovie(key)) return;
+
+    player.loading = false;
+    player.loaded = false;
+
+    console.error("[PLAYER] load failed:", error);
+
+    showError(`${error?.message || error}. Новая попытка через 4 сек…`);
+
+    player.retryTimer = setTimeout(() => {
+      player.retryTimer = null;
+
+      if (!isCurrentMovie(key)) return;
+
+      hideError();
+      loadFreshMovieSource(currentState.movie, key);
+    }, 4000);
+  }
+}
+
+function retryFreshMovieSource(reason) {
+  if (!player.key || !currentState?.movie) return;
+
+  const key = player.key;
+
+  // Avoid a storm of retries from multiple media error events.
+  if (player.loading || player.retryTimer) return;
+
+  console.warn("[PLAYER] refreshing signed VK source:", reason);
+
+  player.loaded = false;
+  player.qualityIndex = -1;
+
+  showError(`${reason}. Обновляю ссылку VK…`);
+
+  player.retryTimer = setTimeout(() => {
+    player.retryTimer = null;
+
+    if (!isCurrentMovie(key)) return;
+
+    hideError();
+    loadFreshMovieSource(currentState.movie, key);
+  }, 1500);
+}
+
+
+function preloadSecondsLeft(state) {
+  if (!state?.autoStartAt) return 0;
+
+  return Math.max(
+    0,
+    Math.ceil((Number(state.autoStartAt) - serverNowMs()) / 1000)
+  );
+}
+
+function updatePreloadOverlay(state) {
+  if (!player.preloadOverlay) return;
+
+  if (player.lateJoinActive && !player.lateJoinStarted) {
+    player.preloadOverlay.hidden = false;
+
+    if (player.preloadTitle) {
+      player.preloadTitle.textContent = "Подготовка к подключению";
+    }
+
+    if (player.preloadLabel) {
+      player.preloadLabel.textContent = "Подключение через";
+    }
+
+    if (player.preloadTimerText) {
+      player.preloadTimerText.textContent = fmt(lateJoinSecondsLeft());
+    }
+
+    return;
+  }
+
+  const active =
+    state?.phase === "PAUSED" &&
+    Boolean(state?.autoStartAt) &&
+    !globalPreloadExpired(state);
+
+  if (!active) {
+    player.preloadOverlay.hidden = true;
+    return;
+  }
+
+  player.preloadOverlay.hidden = false;
+
+  if (player.preloadTitle) {
+    player.preloadTitle.textContent = "Предзагрузка фильма";
+  }
+
+  if (player.preloadLabel) {
+    player.preloadLabel.textContent = "Общий старт через";
+  }
+
+  if (player.preloadTimerText) {
+    player.preloadTimerText.textContent = fmt(preloadSecondsLeft(state));
+  }
+}
+
+function bufferedAhead(video) {
+  if (!video || !video.buffered?.length) return 0;
+
+  const t = Number(video.currentTime) || 0;
+
+  for (let i = 0; i < video.buffered.length; i++) {
+    const start = video.buffered.start(i);
+    const end = video.buffered.end(i);
+
+    if (t >= start - 0.25 && t <= end + 0.25) {
+      return Math.max(0, end - t);
+    }
+  }
+
+  return 0;
+}
+
+function isTimeBuffered(video, time, margin = 0.35) {
+  if (!video || !video.buffered?.length) return false;
+
+  for (let i = 0; i < video.buffered.length; i++) {
+    const start = video.buffered.start(i);
+    const end = video.buffered.end(i);
+
+    if (time >= start - margin && time <= end - margin) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/* ---------------- HOST SYNCHRONIZATION ---------------- */
+
+function seekToHost(force = false) {
+  if (!player.video || !player.loaded || !currentState?.movie) return;
+  if (player.video.readyState < 1) return;
+
+  // Late joiners preload a FUTURE point while paused.
+  if (player.lateJoinActive && !player.lateJoinStarted) {
+    const target = Number(player.lateJoinTargetPosition);
+
+    if (Number.isFinite(target)) {
+      const local = Number(player.video.currentTime) || 0;
+
+      if (force || Math.abs(local - target) > 0.35) {
+        try {
+          player.video.currentTime = target;
+          console.log(`[LATE JOIN] preload seek -> ${target.toFixed(2)}s`);
+        } catch {}
+      }
+    }
+
+    return;
+  }
+
+  // During the common preload window every on-time viewer stays at 0.
+  if (
+    currentState.phase === "PAUSED" &&
+    currentState.autoStartAt &&
+    !globalPreloadExpired(currentState)
+  ) {
+    if (Math.abs(Number(player.video.currentTime) || 0) > 0.1) {
+      try {
+        player.video.currentTime = 0;
+      } catch {}
+    }
+    return;
+  }
+
+  if (
+    !force &&
+    wantsPlayback(currentState) &&
+    !player.firstFrameSeen
+  ) {
+    return;
+  }
+
+  if (!force && player.buffering) {
+    return;
+  }
+
+  let target = serverPosition(currentState);
+
+  if (Number.isFinite(player.video.duration) && player.video.duration > 0) {
+    target = Math.min(
+      target,
+      Math.max(0, player.video.duration - 0.2)
+    );
+  }
+
+  const local = Number(player.video.currentTime) || 0;
+  const drift = target - local;
+
+  const threshold =
+    currentState.phase === "PAUSED" && !globalPreloadExpired(currentState)
+      ? 0.6
+      : 3.5;
+
+  if (!(force || Math.abs(drift) > threshold)) return;
+
+  if (!force && !isTimeBuffered(player.video, target)) {
+    console.log(
+      `[SYNC] skip seek: target ${target.toFixed(2)}s not buffered; local=${local.toFixed(2)}s drift=${drift.toFixed(2)}s`
+    );
+    return;
+  }
+
+  try {
+    player.video.currentTime = target;
+
+    console.log(
+      `[SYNC] seek -> ${target.toFixed(2)}s, drift=${drift.toFixed(2)}s, force=${force}`
+    );
+  } catch {}
+}
+function requestPlayback() {
+  const video = player.video;
+
+  if (
+    !video ||
+    !player.loaded ||
+    !wantsPlayback(currentState) ||
+    video.ended ||
+    !video.paused
+  ) {
+    if (video && !video.paused) hideTap();
+    return;
+  }
+
+  if (player.playAttemptPending) return;
+
+  player.playAttemptPending = true;
+
+  clearTimeout(player.playWatchdog);
+
+  // Some embedded Chromium versions can leave play() pending.
+  // UI must never depend on that Promise settling.
+  player.playWatchdog = setTimeout(() => {
+    player.playWatchdog = null;
+    player.playAttemptPending = false;
+
+    if (
+      player.video &&
+      wantsPlayback(currentState) &&
+      player.video.paused &&
+      !player.video.ended
+    ) {
+      showTap();
+    }
+  }, 1800);
+
+  let promise;
+
+  try {
+    promise = video.play();
+  } catch (error) {
+    clearTimeout(player.playWatchdog);
+    player.playWatchdog = null;
+    player.playAttemptPending = false;
+
+    console.log("[PLAYER] autoplay threw:", error);
+    showTap();
+    return;
+  }
+
+  Promise.resolve(promise)
+    .then(() => {
+      clearTimeout(player.playWatchdog);
+      player.playWatchdog = null;
+      player.playAttemptPending = false;
+
+      hideLoader();
+      hideTap();
+    })
+    .catch((error) => {
+      clearTimeout(player.playWatchdog);
+      player.playWatchdog = null;
+      player.playAttemptPending = false;
+
+      console.log("[PLAYER] autoplay rejected:", error);
+      showTap();
+    });
+}
+
+function handleUserPlayGesture() {
+  if (!player.video) return;
+
+  if (
+    player.lateJoinActive &&
+    !player.lateJoinStarted
+  ) {
+    return;
+  }
+
+  if (!wantsPlayback(currentState)) {
+    return;
+  }
+
+  player.tap.disabled = true;
+  player.tap.textContent = "Запускаю…";
+
+  // This is inside the user's click event. No await before calling play().
+  let promise;
+
+  try {
+    promise = player.video.play();
+  } catch (error) {
+    console.error("[PLAYER] manual play threw:", error);
+    showTap();
+    return;
+  }
+
+  const fallback = setTimeout(() => {
+    if (!player.video) return;
+
+    if (player.video.paused) {
+      showTap();
+    } else {
+      hideTap();
+      hideLoader();
+    }
+  }, 2500);
+
+  Promise.resolve(promise)
+    .then(() => {
+      clearTimeout(fallback);
+      hideTap();
+      hideLoader();
+      seekToHost(true);
+    })
+    .catch((error) => {
+      clearTimeout(fallback);
+      console.error("[PLAYER] manual play rejected:", error);
+      showTap();
+    });
+}
+
+function applyHostState(forceSeek = false) {
+  const state = currentState;
+  const video = player.video;
+
+  if (!state?.movie || !video || !player.loaded) return;
+  if (movieKey(state.movie) !== player.key) return;
+
+  updatePreloadOverlay(state);
+
+  // Late join mode:
+  // 1) seek to a future position;
+  // 2) buffer there for ~3 minutes while the room approaches it;
+  // 3) only join playback when the authoritative room reaches that position.
+  if (player.lateJoinActive && !player.lateJoinStarted) {
+    seekToHost(forceSeek);
+
+    const target = Number(player.lateJoinTargetPosition);
+    const currentRoomPosition = serverPosition(state);
+
+    if (
+      Number.isFinite(target) &&
+      currentRoomPosition >= target
+    ) {
+      const catchupTarget = Math.min(
+        currentRoomPosition,
+        Number.isFinite(video.duration)
+          ? Math.max(0, video.duration - 0.2)
+          : currentRoomPosition
+      );
+
+      if (
+        isTimeBuffered(video, catchupTarget, 0.05) ||
+        Math.abs((Number(video.currentTime) || 0) - catchupTarget) < 0.8
+      ) {
+        try {
+          video.currentTime = catchupTarget;
+        } catch {}
+
+        player.lateJoinStarted = true;
+        player.lateJoinActive = false;
+        player.firstFrameSeen = false;
+
+        console.log(
+          `[LATE JOIN] joining room @ ${catchupTarget.toFixed(2)}s`
+        );
+
+        updatePreloadOverlay(state);
+        emitPlaybackProgress();
+        requestPlayback();
+        return;
+      }
+
+      // The planned point was not buffered enough yet.
+      // Keep paused and let range requests continue instead of stuttering.
+      if (!video.paused) video.pause();
+      return;
+    }
+
+    if (!video.paused) video.pause();
+    hideTap();
+    return;
+  }
+
+  seekToHost(forceSeek);
+
+  // Common one-minute preload. All clients use server-synchronized time.
+  if (
+    state.phase === "PAUSED" &&
+    state.autoStartAt &&
+    !globalPreloadExpired(state)
+  ) {
+    clearTimeout(player.playWatchdog);
+    player.playWatchdog = null;
+    player.playAttemptPending = false;
+
+    if (!video.paused) video.pause();
+
+    hideLoader();
+    hideTap();
+
+    try {
+      if (Math.abs(video.currentTime) > 0.1) video.currentTime = 0;
+    } catch {}
+
+    return;
+  }
+
+  // Manual host pause (not the scheduled preload).
+  if (
+    state.phase === "PAUSED" &&
+    !state.autoStartAt
+  ) {
+    clearTimeout(player.playWatchdog);
+    player.playWatchdog = null;
+    player.playAttemptPending = false;
+
+    if (!video.paused) video.pause();
+
+    hideLoader();
+    hideTap();
+    emitPlaybackProgress();
+    return;
+  }
+
+  // WATCHING or the exact local moment at which scheduled preload expired.
+  if (wantsPlayback(state)) {
+    requestPlayback();
+    emitPlaybackProgress();
+  }
+}
+/* ---------------- VOTING ---------------- */
+
+function remainingVotingSeconds(state) {
+  return Math.max(
+    0,
+    Math.ceil((Number(state.voteEndsAt) - serverNowMs()) / 1000)
+  );
+}
+
+function renderVoting(state) {
+  destroyPlayer();
+
+  const suggestions = Array.isArray(state.suggestions)
+    ? state.suggestions
+    : [];
+
+  const canSuggest = !state.mySuggestionId;
+
+  app.innerHTML = `
+    <main class="screen voting-screen">
+      <section class="vote-wrap">
+        <header class="vote-header">
+          <div>
+            <div class="vote-kicker">MOVIE NIGHT</div>
+            <h1>Что смотрим дальше?</h1>
+          </div>
+
+          <div class="vote-timer" id="voteTimer">
+            ${fmt(remainingVotingSeconds(state))}
+          </div>
+        </header>
+
+        <div class="vote-grid">
+          <section class="vote-panel">
+            <h2>Предложить фильм</h2>
+
+            ${
+              canSuggest
+                ? `
+                  <form id="proposalForm">
+                    <label>
+                      Название
+                      <input
+                        id="proposalTitle"
+                        maxlength="100"
+                        required
+                        placeholder="Название фильма"
+                      />
+                    </label>
+
+                    <label>
+                      Ссылка VK Видео
+                      <input
+                        id="proposalUrl"
+                        required
+                        placeholder="https://vkvideo.ru/video-..."
+                      />
+                    </label>
+
+                    <button class="primary-action" type="submit">
+                      Предложить
+                    </button>
+
+                    <div id="proposalError" class="form-error"></div>
+                  </form>
+                `
+                : `
+                  <div class="already-proposed">
+                    ✓ Ты уже предложил фильм
+                  </div>
+                `
+            }
+          </section>
+
+          <section class="vote-panel">
+            <h2>Голосование</h2>
+
+            <div class="suggestions">
+              ${
+                suggestions.length
+                  ? suggestions
+                      .map(
+                        (item) => `
+                          <button
+                            class="suggestion ${
+                              state.myVote === item.id ? "selected" : ""
+                            }"
+                            data-vote-id="${esc(item.id)}"
+                          >
+                            <div class="suggestion-main">
+                              <strong>${esc(item.title)}</strong>
+                              <span>
+                                Предложил: ${esc(item.proposerName || "Участник")}
+                              </span>
+                            </div>
+
+                            <div class="vote-count">
+                              ${Number(item.votes) || 0}
+                            </div>
+                          </button>
+                        `
+                      )
+                      .join("")
+                  : `
+                    <div class="no-suggestions">
+                      Пока никто ничего не предложил.
+                    </div>
+                  `
+              }
+            </div>
+
+            <div id="voteError" class="form-error"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+  `;
+
+  const timer = document.querySelector("#voteTimer");
+
+  const timerInterval = setInterval(() => {
+    if (!document.body.contains(timer)) {
+      clearInterval(timerInterval);
+      return;
+    }
+
+    timer.textContent = fmt(
+      remainingVotingSeconds(currentState || state)
+    );
+  }, 500);
+
+  const form = document.querySelector("#proposalForm");
+
+  if (form) {
+    form.onsubmit = (event) => {
+      event.preventDefault();
+
+      const title =
+        document.querySelector("#proposalTitle").value.trim();
+
+      const url =
+        document.querySelector("#proposalUrl").value.trim();
+
+      const errorBox =
+        document.querySelector("#proposalError");
+
+      errorBox.textContent = "";
+
+      socket.emit(
+        "vote:suggest",
+        { title, url },
+        (result) => {
+          if (!result?.ok) {
+            errorBox.textContent =
+              result?.error ||
+              "Не удалось предложить фильм.";
+          }
+        }
+      );
+    };
+  }
+
+  document
+    .querySelectorAll("[data-vote-id]")
+    .forEach((button) => {
+      button.onclick = () => {
+        const errorBox =
+          document.querySelector("#voteError");
+
+        errorBox.textContent = "";
+
+        socket.emit(
+          "vote:cast",
+          { suggestionId: button.dataset.voteId },
+          (result) => {
+            if (!result?.ok) {
+              errorBox.textContent =
+                result?.error ||
+                "Не удалось проголосовать.";
+            }
+          }
+        );
+      };
+    });
+}
+
+/* ---------------- STATE / DISCORD ---------------- */
+
+function renderState(state) {
+  if (!state) return;
+
+  if (state.phase === "WATCHING" || state.phase === "PAUSED") {
+    renderMovie(state);
+    return;
+  }
+
+  if (state.phase === "VOTING") {
+    renderVoting(state);
+    return;
+  }
+
+  renderIdle();
+}
+
+async function authenticateDiscord() {
+  await discordSdk.ready();
+
+  if (discordSdk.guildId !== ALLOWED_GUILD_ID) {
+    throw new Error("Activity открыта не на разрешённом сервере.");
+  }
+
+  const { code } = await discordSdk.commands.authorize({
+    client_id: CLIENT_ID,
+    response_type: "code",
+    state: "",
+    prompt: "none",
+    scope: ["identify"],
+  });
+
+  const response = await fetch("/api/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ code }),
+  });
+
+  const json = await response.json().catch(() => ({}));
+
+  if (!response.ok || !json.access_token) {
+    throw new Error(
+      json.error ||
+      "Не удалось получить Discord access token."
+    );
+  }
+
+  const auth = await discordSdk.commands.authenticate({
+    access_token: json.access_token,
+  });
+
+  if (!auth?.user?.id) {
+    throw new Error("Discord authenticate не вернул пользователя.");
+  }
+
+  return json.access_token;
+}
+
+function connectBackend(accessToken) {
+  socket = io({
+    transports: ["websocket", "polling"],
+    auth: {
+      accessToken,
+      instanceId: discordSdk.instanceId,
+      guildId: discordSdk.guildId,
+      channelId: discordSdk.channelId,
+    },
+  });
+
+  socket.on("connect", () => {
+    console.log("[BACKEND] connected", socket.id);
+
+    syncServerClock();
+
+    clearInterval(clockSyncInterval);
+    clockSyncInterval = setInterval(() => {
+      syncServerClock();
+    }, 30_000);
+  });
+
+  socket.on("connect_error", (error) => {
+    console.error("[BACKEND] connect_error", error);
+    renderFatal(
+      "Нет соединения с Movie Night",
+      error.message
+    );
+  });
+
+  socket.on("session:state", (state) => {
+    absorbStateClock(state);
+
+    if (firstSessionState) {
+      firstSessionState = false;
+
+      if (
+        state?.phase === "WATCHING" &&
+        state?.movie
+      ) {
+        lateJoinCandidateKey = movieKey(state.movie);
+      }
+    }
+
+    currentState = state;
+    renderState(state);
+  });
+
+  socket.on("session:error", (message) => {
+    console.error("[BACKEND] session:error", message);
+  });
+}
+
+async function boot() {
+  renderBoot("Подключение к Movie Night…");
+
+  try {
+    const accessToken = await authenticateDiscord();
+    connectBackend(accessToken);
+  } catch (error) {
+    console.error(error);
+
+    renderFatal(
+      "Не удалось запустить Movie Night",
+      error.message
+    );
+  }
+}
+
+boot();

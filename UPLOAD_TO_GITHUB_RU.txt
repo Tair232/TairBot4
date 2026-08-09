@@ -1,0 +1,74 @@
+GITHUB / BOTHOST — КАК ДОЛЖЕН ВЫГЛЯДЕТЬ КОРЕНЬ РЕПОЗИТОРИЯ
+=========================================================
+
+После загрузки на GitHub на ПЕРВОЙ странице репозитория должны быть видны:
+
+Dockerfile
+index.html
+main.js
+style.css
+server.js
+package.json
+package-lock.json
+vite.config.js
+.env.example
+.gitignore
+.dockerignore
+README_BOTHOST_RU.txt
+
+ВАЖНО:
+main.js теперь находится прямо в корне.
+Папка src больше вообще не используется.
+
+server.js тоже находится прямо в корне.
+Папка server больше не используется.
+
+index.html загружает:
+  /main.js
+
+Команда production-запуска:
+  node server.js
+
+Docker build:
+  npm install
+  npm run build
+  node server.js
+
+Если GitHub показывает сверху дополнительную папку вроде:
+  movie-night-v9-7-bothost-flat/
+
+а перечисленные файлы находятся ВНУТРИ неё,
+то это неправильно для текущей настройки Bothost.
+Файлы должны находиться непосредственно в корне ветки main.
+
+
+КАК ПЕРЕЗАЛИТЬ
+==============
+Самый простой вариант:
+
+1. Удали старые файлы из репозитория Tairbot3
+   или создай новый пустой репозиторий.
+
+2. Распакуй ZIP V9.7.
+
+3. Открой распакованную папку.
+
+4. Выдели ВСЕ файлы внутри неё:
+   Dockerfile, index.html, main.js, server.js и т.д.
+
+5. Загрузи их в КОРЕНЬ GitHub репозитория.
+
+6. Убедись прямо на странице GitHub, что видишь:
+   main.js
+   server.js
+   index.html
+   Dockerfile
+
+7. После этого в Bothost нажми "Пересобрать".
+
+
+СЕКРЕТЫ
+=======
+.env в архиве отсутствует специально.
+DISCORD_BOT_TOKEN и DISCORD_CLIENT_SECRET задаются только
+через Variables / Environment Variables в Bothost.

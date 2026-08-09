@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+node_modules
+data/state.json
+*.log
+START_*.bat
+EDIT_SECRETS.bat
