@@ -60,6 +60,27 @@ input {
   outline: 0;
 }
 
+.kodik-frame {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  outline: 0;
+  background: #000;
+}
+
+.kodik-screen .movie-loader,
+.kodik-screen .movie-error,
+.kodik-screen .preload-overlay,
+.kodik-screen .volume-hud,
+.kodik-screen .time-hud,
+.kodik-screen .tap-to-play {
+  /* Parent Activity UI must stay above the embedded player. */
+  isolation: isolate;
+}
+
 /*
   During successful playback nothing except <video> remains visible.
   These overlays exist only before the first playable frame / on a real error.
@@ -714,5 +735,288 @@ input:focus {
       calc(10px + var(--sair))
       calc(10px + var(--saib))
       calc(10px + var(--sail));
+  }
+}
+
+
+/* V9.17 — mixed movie/anime voting */
+.proposal-section {
+  display: grid;
+  gap: 13px;
+}
+
+.proposal-section-title {
+  font-size: 14px;
+  font-weight: 800;
+  color: #e8ebf3;
+}
+
+.proposal-divider {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-height: 30px;
+  margin: 3px 0;
+  color: #697286;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .12em;
+}
+
+.proposal-divider::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: #2c3341;
+}
+
+.proposal-divider span {
+  position: relative;
+  padding: 0 10px;
+  background: rgba(20, 24, 34, .92);
+}
+
+.secondary-action {
+  min-height: 42px;
+  padding: 11px 14px;
+  color: #e8ebf3;
+  background: #171c27;
+  border: 1px solid #3a4356;
+  border-radius: 11px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.secondary-action:hover {
+  background: #202736;
+}
+
+.secondary-action:disabled,
+.primary-action:disabled {
+  opacity: .58;
+  cursor: default;
+}
+
+.anime-search-status {
+  min-height: 18px;
+  color: #8f98aa;
+  font-size: 12px;
+}
+
+.anime-search-results {
+  display: grid;
+  gap: 7px;
+}
+
+.anime-search-result {
+  width: 100%;
+  min-height: 62px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  color: #fff;
+  background: #0a0e15;
+  border: 1px solid #2e3645;
+  border-radius: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.anime-search-result:hover {
+  background: #131925;
+  border-color: #4a5570;
+}
+
+.anime-result-main {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.anime-result-main strong,
+.anime-result-main span,
+.anime-result-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.anime-result-main span {
+  color: #9ca5b8;
+  font-size: 11px;
+}
+
+.anime-result-main small {
+  color: #737d90;
+  font-size: 10px;
+}
+
+.anime-result-add {
+  flex: 0 0 auto;
+  padding: 7px 9px;
+  color: #dfe3ff;
+  background: #222a4a;
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.suggestion-type {
+  color: #a8b0c1;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .04em;
+}
+
+.vote-notice {
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  color: #ffd6a0;
+  background: #332515;
+  border: 1px solid #72522a;
+  border-radius: 12px;
+  font-size: 12px;
+}
+
+.dub-vote-wrap {
+  max-width: 860px;
+}
+
+.dub-anime-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 8px;
+  color: #aeb6c7;
+  font-size: 14px;
+}
+
+.dub-anime-title span {
+  padding: 3px 7px;
+  background: #1c2230;
+  border-radius: 7px;
+  font-size: 11px;
+}
+
+.dub-vote-panel {
+  max-width: 760px;
+}
+
+.dub-explanation {
+  margin-bottom: 14px;
+  color: #8e97aa;
+  font-size: 12px;
+}
+
+.dub-suggestions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@media (pointer: coarse), (max-width: 760px) {
+  .secondary-action {
+    min-height: 48px;
+    font-size: 16px;
+  }
+
+  .anime-search-result {
+    min-height: 70px;
+    padding: 12px;
+  }
+
+  .anime-result-add {
+    padding: 9px 10px;
+  }
+
+  .dub-suggestions {
+    grid-template-columns: 1fr;
+  }
+}
+
+
+/* V9.18 — no-key anime/dub flow */
+.dub-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, .85fr) minmax(320px, 1.15fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.dub-source-hint {
+  margin-bottom: 14px;
+  padding: 11px 12px;
+  color: #aab3c5;
+  background: #0c1119;
+  border: 1px solid #293142;
+  border-radius: 11px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.dub-proposal-form {
+  display: grid;
+  gap: 12px;
+}
+
+@media (pointer: coarse), (max-width: 760px) {
+  .dub-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+
+/* V9.19 — automatic AnimeGo -> Kodik dub discovery */
+.auto-dub-panel {
+  max-width: 760px;
+  margin: 0 auto;
+}
+
+.auto-dub-loading,
+.auto-dub-empty {
+  min-height: 180px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 10px;
+  padding: 24px;
+  text-align: center;
+}
+
+.auto-dub-loading .spinner {
+  width: 30px;
+  height: 30px;
+}
+
+.auto-dub-loading strong,
+.auto-dub-empty strong {
+  font-size: 18px;
+}
+
+.auto-dub-loading span,
+.auto-dub-empty span {
+  max-width: 480px;
+  color: #8f98aa;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.auto-dub-empty .primary-action {
+  width: min(260px, 100%);
+  margin-top: 6px;
+}
+
+.auto-dub-panel .dub-suggestions {
+  margin-top: 12px;
+}
+
+@media (pointer: coarse), (max-width: 760px) {
+  .auto-dub-loading,
+  .auto-dub-empty {
+    min-height: 160px;
+    padding: 18px 10px;
   }
 }
