@@ -1106,9 +1106,21 @@ app.get("/api/media", async (req, res) => {
 // Production: Vite is built into ./dist and served by the same Express app.
 // Development still uses the separate Vite dev server.
 if (fs.existsSync(DIST_DIR)) {
+  // Discord Activity clients can stay alive for a long time. Never cache the
+  // shell/assets here: mixed client builds caused some viewers to use /kodik
+  // while others used /kodikplayer in the same room.
   app.use(express.static(DIST_DIR, {
-    index: "index.html",
-    maxAge: "1h",
+    index: false,
+    maxAge: 0,
+    etag: false,
+    setHeaders(res) {
+      res.setHeader(
+        "Cache-Control",
+        "no-store, no-cache, must-revalidate, proxy-revalidate"
+      );
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+    },
   }));
 }
 
@@ -3169,6 +3181,13 @@ app.use((req, res, next) => {
     !req.path.startsWith("/api/") &&
     !req.path.startsWith("/socket.io")
   ) {
+    res.setHeader(
+      "Cache-Control",
+      "no-store, no-cache, must-revalidate, proxy-revalidate"
+    );
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+
     return res.sendFile(path.join(DIST_DIR, "index.html"));
   }
 
