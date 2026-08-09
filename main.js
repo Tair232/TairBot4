@@ -674,7 +674,16 @@ function kodikProxyPath(movie) {
     throw new Error("Kodik path отсутствует.");
   }
 
-  // /kodik is a Discord Activity URL Mapping -> kodik.info
+  const host = String(movie?.kodikHost || "kodik.info").toLowerCase();
+
+  if (host === "kodikplayer.com") {
+    // Discord Activity URL Mapping:
+    // /kodikplayer -> kodikplayer.com
+    return `/kodikplayer${raw}`;
+  }
+
+  // Discord Activity URL Mapping:
+  // /kodik -> kodik.info
   return `/kodik${raw}`;
 }
 
