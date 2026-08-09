@@ -80,7 +80,7 @@ def source_is_kodik(url: object) -> bool:
     try:
         parsed = urlparse(normalize_player_url(url))
 
-        if parsed.scheme != "https:":
+        if parsed.scheme != "https":
             return False
 
         if not parsed.hostname:
@@ -93,17 +93,25 @@ def source_is_kodik(url: object) -> bool:
 
 def canonical_kodik_url(url: object) -> str | None:
     """
-    Movie Night has a Discord URL Mapping for kodik.info. Rebuild the
-    compatible player URL on that mapped host while preserving its player
-    id/hash/quality path and query parameters.
+    Preserve the real player hostname returned by AnimeGo.
+    Current AnimeGo results commonly use kodikplayer.com. Rewriting that
+    hostname to kodik.info can break otherwise valid player URLs.
     """
     try:
-        parsed = urlparse(normalize_player_url(url))
+        raw = normalize_player_url(url)
+        parsed = urlparse(raw)
 
-        if not source_is_kodik(url):
+        if not source_is_kodik(raw):
             return None
 
-        result = f"https://kodik.info{parsed.path}"
+        host = (parsed.hostname or "").lower()
+
+        # We currently proxy these two official/observed Kodik hosts from
+        # Discord Activity URL Mappings.
+        if host not in {"kodikplayer.com", "kodik.info"}:
+            return None
+
+        result = f"https://{host}{parsed.path}"
 
         if parsed.query:
             result += f"?{parsed.query}"
