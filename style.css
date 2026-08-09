@@ -147,6 +147,32 @@ input {
   font-variant-numeric: tabular-nums;
 }
 
+.late-join-skip {
+  min-height: 42px;
+  margin-top: 7px;
+  padding: 9px 16px;
+  border: 1px solid rgba(255, 255, 255, .2);
+  border-radius: 999px;
+  color: #fff;
+  background: rgba(255, 255, 255, .12);
+  font-weight: 700;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.late-join-skip:hover {
+  background: rgba(255, 255, 255, .2);
+}
+
+.late-join-skip:active {
+  transform: translateY(1px);
+}
+
+.late-join-skip:disabled {
+  opacity: .55;
+  cursor: default;
+}
+
 
 .volume-hud {
   position: absolute;
