@@ -1,4 +1,4 @@
-import { DiscordSDK } from "@discord/embedded-app-sdk";
+import { DiscordSDK, Common } from "@discord/embedded-app-sdk";
 import { io } from "socket.io-client";
 import "./style.css";
 
@@ -7,6 +7,37 @@ const ALLOWED_GUILD_ID = "1492151172570808390";
 
 const app = document.querySelector("#app");
 const discordSdk = new DiscordSDK(CLIENT_ID);
+
+const isLikelyTouchDevice =
+  matchMedia("(pointer: coarse)").matches ||
+  navigator.maxTouchPoints > 0;
+
+let lastOrientationMode = null;
+
+async function setActivityOrientation(mode) {
+  if (lastOrientationMode === mode) return;
+  lastOrientationMode = mode;
+
+  try {
+    const orientation =
+      mode === "movie"
+        ? Common.OrientationLockStateTypeObject.LANDSCAPE
+        : Common.OrientationLockStateTypeObject.PORTRAIT;
+
+    await discordSdk.commands.setOrientationLockState({
+      lock_state: orientation,
+      picture_in_picture_lock_state:
+        Common.OrientationLockStateTypeObject.LANDSCAPE,
+      grid_lock_state:
+        Common.OrientationLockStateTypeObject.LANDSCAPE,
+    });
+
+    console.log(`[MOBILE] orientation -> ${mode}`);
+  } catch (error) {
+    // Expected on desktop/web because this SDK command is mobile-only.
+    console.log("[MOBILE] orientation lock unavailable on this client");
+  }
+}
 
 let socket = null;
 let currentState = null;
@@ -120,6 +151,10 @@ const player = {
   volumeButton: null,
   volumeSlider: null,
   volumeHideTimer: null,
+  controlsVisible: false,
+
+  timeHud: null,
+  timeRemainingText: null,
 };
 
 function esc(value) {
@@ -264,7 +299,12 @@ function destroyPlayer() {
   player.volumeHud = null;
   player.volumeButton = null;
   player.volumeSlider = null;
+  player.volumeValue = null;
   player.volumeHideTimer = null;
+  player.controlsVisible = false;
+
+  player.timeHud = null;
+  player.timeRemainingText = null;
 }
 
 function setLoader(text) {
@@ -356,9 +396,15 @@ function renderMovie(state) {
       </div>
 
       <div id="volumeHud" class="volume-hud">
-        <button id="volumeButton" class="volume-button" type="button" aria-label="Звук">
+        <button
+          id="volumeButton"
+          class="volume-button"
+          type="button"
+          aria-label="Звук"
+        >
           🔊
         </button>
+
         <input
           id="volumeSlider"
           class="volume-slider"
@@ -369,6 +415,18 @@ function renderMovie(state) {
           value="100"
           aria-label="Громкость"
         />
+
+        <span id="volumeValue" class="volume-value">100%</span>
+      </div>
+
+      <div
+        id="timeHud"
+        class="time-hud"
+        aria-live="off"
+        aria-label="Оставшееся время фильма"
+      >
+        <span class="time-hud-label">Осталось</span>
+        <strong id="timeRemainingText">--:--</strong>
       </div>
 
       <button id="tapToPlay" class="tap-to-play" hidden>
@@ -398,6 +456,10 @@ function renderMovie(state) {
   player.volumeHud = document.querySelector("#volumeHud");
   player.volumeButton = document.querySelector("#volumeButton");
   player.volumeSlider = document.querySelector("#volumeSlider");
+  player.volumeValue = document.querySelector("#volumeValue");
+
+  player.timeHud = document.querySelector("#timeHud");
+  player.timeRemainingText = document.querySelector("#timeRemainingText");
 
   setupVolumeControls();
   configureLateJoinIfNeeded(state, key);
@@ -544,6 +606,7 @@ function renderMovie(state) {
 
   player.syncTimer = setInterval(() => {
     updatePreloadOverlay(currentState);
+    updateTimeRemaining();
     applyHostState(false);
     emitPlaybackProgress();
   }, 1000);
@@ -663,11 +726,46 @@ function skipLateJoinWait() {
   }
 }
 
+function formatRemainingTime(seconds) {
+  seconds = Math.max(0, Math.ceil(Number(seconds) || 0));
+
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+
+  if (h > 0) {
+    return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
+
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function updateTimeRemaining() {
+  if (!player.timeRemainingText || !player.video) return;
+
+  const video = player.video;
+  let duration = Number(video.duration);
+
+  if (!Number.isFinite(duration) || duration <= 0) {
+    duration = Number(currentState?.movie?.duration);
+  }
+
+  if (!Number.isFinite(duration) || duration <= 0) {
+    player.timeRemainingText.textContent = "--:--";
+    return;
+  }
+
+  const current = Math.max(0, Number(video.currentTime) || 0);
+  player.timeRemainingText.textContent =
+    formatRemainingTime(Math.max(0, duration - current));
+}
+
 function setupVolumeControls() {
   const video = player.video;
   const hud = player.volumeHud;
   const button = player.volumeButton;
   const slider = player.volumeSlider;
+  const valueLabel = player.volumeValue;
   const screen = document.querySelector(".movie-screen");
 
   if (!video || !hud || !button || !slider || !screen) return;
@@ -677,6 +775,7 @@ function setupVolumeControls() {
   try {
     const raw = localStorage.getItem("movieNightVolume");
     const parsed = Number(raw);
+
     if (Number.isFinite(parsed)) {
       savedVolume = Math.min(1, Math.max(0, parsed));
     }
@@ -684,10 +783,12 @@ function setupVolumeControls() {
 
   video.volume = savedVolume;
   video.muted = savedVolume <= 0;
-
   slider.value = String(Math.round(savedVolume * 100));
 
-  const refreshIcon = () => {
+  const refresh = () => {
+    const effective = video.muted ? 0 : video.volume;
+    const percent = Math.round(effective * 100);
+
     if (video.muted || video.volume <= 0.001) {
       button.textContent = "🔇";
     } else if (video.volume < 0.5) {
@@ -695,35 +796,54 @@ function setupVolumeControls() {
     } else {
       button.textContent = "🔊";
     }
+
+    if (valueLabel) {
+      valueLabel.textContent = `${percent}%`;
+    }
   };
 
-  const showHud = () => {
+  const timeHud = player.timeHud;
+
+  const hideHud = () => {
+    hud.classList.remove("visible");
+    timeHud?.classList.remove("visible");
+    player.controlsVisible = false;
+  };
+
+  const showHud = (duration = 2200) => {
+    updateTimeRemaining();
+
     hud.classList.add("visible");
+    timeHud?.classList.add("visible");
+    player.controlsVisible = true;
 
     clearTimeout(player.volumeHideTimer);
+
     player.volumeHideTimer = setTimeout(() => {
-      hud.classList.remove("visible");
-    }, 1800);
+      hideHud();
+    }, duration);
   };
 
   slider.addEventListener("input", () => {
-    const value = Math.min(
+    const next = Math.min(
       1,
       Math.max(0, Number(slider.value) / 100)
     );
 
-    video.volume = value;
-    video.muted = value <= 0;
+    video.volume = next;
+    video.muted = next <= 0;
 
     try {
-      localStorage.setItem("movieNightVolume", String(value));
+      localStorage.setItem("movieNightVolume", String(next));
     } catch {}
 
-    refreshIcon();
-    showHud();
+    refresh();
+    showHud(3000);
   });
 
-  button.addEventListener("click", () => {
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+
     if (video.muted || video.volume <= 0.001) {
       const fallback =
         Number(slider.value) > 0
@@ -737,17 +857,55 @@ function setupVolumeControls() {
       video.muted = true;
     }
 
-    refreshIcon();
-    showHud();
+    refresh();
+    showHud(3000);
   });
 
-  screen.addEventListener("mousemove", showHud, { passive: true });
-  screen.addEventListener("touchstart", showHud, { passive: true });
-  hud.addEventListener("mouseenter", showHud);
+  hud.addEventListener("pointerdown", (event) => {
+    event.stopPropagation();
+    showHud(3000);
+  });
 
-  refreshIcon();
+  // Desktop: behave like YouTube on mouse movement.
+  screen.addEventListener(
+    "mousemove",
+    () => showHud(1800),
+    { passive: true }
+  );
+
+  // Phone/tablet: one tap shows controls, another tap on empty movie
+  // while visible can hide them immediately.
+  screen.addEventListener(
+    "pointerup",
+    (event) => {
+      if (!isLikelyTouchDevice) return;
+
+      if (
+        event.target === slider ||
+        event.target === button ||
+        event.target.closest?.(".preload-card") ||
+        event.target.closest?.(".tap-to-play")
+      ) {
+        return;
+      }
+
+      if (player.controlsVisible) {
+        hideHud();
+      } else {
+        showHud(3000);
+      }
+    },
+    { passive: true }
+  );
+
+  video.addEventListener("timeupdate", updateTimeRemaining);
+  video.addEventListener("durationchange", updateTimeRemaining);
+  video.addEventListener("loadedmetadata", updateTimeRemaining);
+  video.addEventListener("seeked", updateTimeRemaining);
+
+  updateTimeRemaining();
+  refresh();
 }
-
 function emitPlaybackProgress(forceEnded = false) {
   if (!socket?.connected || !player.video || !currentState?.movie) return;
   if (movieKey(currentState.movie) !== player.key) return;
@@ -1638,20 +1796,26 @@ function renderState(state) {
   if (!state) return;
 
   if (state.phase === "WATCHING" || state.phase === "PAUSED") {
+    setActivityOrientation("movie");
     renderMovie(state);
     return;
   }
 
   if (state.phase === "VOTING") {
+    setActivityOrientation("ui");
     renderVoting(state);
     return;
   }
 
+  setActivityOrientation("ui");
   renderIdle();
 }
 
 async function authenticateDiscord() {
   await discordSdk.ready();
+
+  // On phones Discord supports orientation locking. Desktop simply ignores it.
+  setActivityOrientation("ui");
 
   if (discordSdk.guildId !== ALLOWED_GUILD_ID) {
     throw new Error("Activity открыта не на разрешённом сервере.");
