@@ -52,13 +52,65 @@ def similarity(a: object, b: object) -> float:
     return SequenceMatcher(None, a_n, b_n).ratio()
 
 
+KODIK_PLAYER_PATH = re.compile(
+    r"^/(?:seria|serial|season|video|film|episode|uv)/"
+    r"\d+/[A-Za-z0-9_-]+/\d{3,4}p/?$",
+    flags=re.IGNORECASE,
+)
+
+
+def normalize_player_url(url: object) -> str:
+    raw = str(url or "").strip()
+
+    if raw.startswith("//"):
+        raw = f"https:{raw}"
+    elif raw.startswith("http://"):
+        raw = f"https://{raw[len('http://'):]}"
+
+    return raw
+
+
 def source_is_kodik(url: object) -> bool:
+    """
+    Kodik-compatible players are NOT guaranteed to use a hostname containing
+    the word "kodik". anicli-api itself recognizes them primarily by player
+    URL shape. AnimeGo can return compatible provider domains such as anivod
+    or other aliases.
+    """
     try:
-        parsed = urlparse(str(url or ""))
-        host = (parsed.hostname or "").lower()
-        return "kodik" in host
+        parsed = urlparse(normalize_player_url(url))
+
+        if parsed.scheme != "https:":
+            return False
+
+        if not parsed.hostname:
+            return False
+
+        return bool(KODIK_PLAYER_PATH.match(parsed.path))
     except Exception:
         return False
+
+
+def canonical_kodik_url(url: object) -> str | None:
+    """
+    Movie Night has a Discord URL Mapping for kodik.info. Rebuild the
+    compatible player URL on that mapped host while preserving its player
+    id/hash/quality path and query parameters.
+    """
+    try:
+        parsed = urlparse(normalize_player_url(url))
+
+        if not source_is_kodik(url):
+            return None
+
+        result = f"https://kodik.info{parsed.path}"
+
+        if parsed.query:
+            result += f"?{parsed.query}"
+
+        return result
+    except Exception:
+        return None
 
 
 def get_year(anime: object) -> int | None:
@@ -203,9 +255,30 @@ def extract_kodik_options(
 
         for source in sources:
             name = str(getattr(source, "title", "") or "").strip()
-            url = str(getattr(source, "url", "") or "").strip()
+            raw_url = str(getattr(source, "url", "") or "").strip()
 
-            if not name or not url or not source_is_kodik(url):
+            if not name or not raw_url:
+                continue
+
+            parsed_source = urlparse(normalize_player_url(raw_url))
+
+            log(
+                "source",
+                repr(name),
+                "host=",
+                parsed_source.hostname or "-",
+                "path=",
+                parsed_source.path or "-",
+                "kodik_compatible=",
+                source_is_kodik(raw_url),
+            )
+
+            if not source_is_kodik(raw_url):
+                continue
+
+            url = canonical_kodik_url(raw_url)
+
+            if not url:
                 continue
 
             norm_url = url.rstrip("/")
@@ -230,6 +303,7 @@ def extract_kodik_options(
                     "url": url,
                     "episode": episode_number,
                     "provider": "AnimeGo/Kodik",
+                    "raw_host": parsed_source.hostname or "",
                 }
             )
 
@@ -252,7 +326,7 @@ def extract_kodik_options(
     return {
         "ok": False,
         "error": (
-            "AnimeGo нашёл тайтл, но не вернул Kodik-озвучки для первой серии."
+            "AnimeGo нашёл тайтл, но не вернул распознаваемые Kodik-плееры для первой серии."
         ),
         "details": failures[-5:],
         "options": [],
