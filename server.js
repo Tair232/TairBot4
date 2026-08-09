@@ -4,6 +4,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import { createServer } from "node:http";
+import { Readable } from "node:stream";
+import { execFile } from "node:child_process";
 import { Server as SocketIOServer } from "socket.io";
 import {
   Client,
@@ -50,6 +52,21 @@ const VOTING_DURATION_SECONDS = Math.max(
   60,
   Number(process.env.VOTING_DURATION_SECONDS) || 600
 );
+
+const DUB_VOTING_DURATION_SECONDS = Math.max(
+  20,
+  Number(process.env.DUB_VOTING_DURATION_SECONDS) || 60
+);
+
+const KODIK_API_KEY = String(process.env.KODIK_API_KEY || "").trim();
+
+const KODIK_API_BASE_URL = String(
+  process.env.KODIK_API_BASE_URL || "https://kodikapi.com"
+).replace(/\/+$/, "");
+
+const SHIKIMORI_API_BASE_URL = String(
+  process.env.SHIKIMORI_API_BASE_URL || "https://shikimori.one"
+).replace(/\/+$/, "");
 
 const MOVIE_PRELOAD_SECONDS = Math.max(
   10,
@@ -102,9 +119,18 @@ const defaultState = () => ({
   positionSeconds: 0,
   startedAt: null,
   autoStartAt: null,
+  seekRevision: 0,
   voteEndsAt: null,
   suggestions: [],
   votes: {},
+
+  dubVoteEndsAt: null,
+  animeWinner: null,
+  dubOptions: [],
+  dubVotes: {},
+  dubSearching: false,
+
+  notice: null,
   lastUpdatedAt: Date.now(),
 });
 
@@ -112,12 +138,22 @@ function normalizeState(raw) {
   const base = defaultState();
   const state = { ...base, ...(raw || {}) };
 
-  if (!["IDLE", "WATCHING", "PAUSED", "VOTING"].includes(state.phase)) {
+  if (
+    !["IDLE", "WATCHING", "PAUSED", "VOTING", "DUB_VOTING"].includes(
+      state.phase
+    )
+  ) {
     state.phase = "IDLE";
   }
 
   if (!Array.isArray(state.suggestions)) state.suggestions = [];
   if (!state.votes || typeof state.votes !== "object") state.votes = {};
+
+  if (!Array.isArray(state.dubOptions)) state.dubOptions = [];
+  if (!state.dubVotes || typeof state.dubVotes !== "object") {
+    state.dubVotes = {};
+  }
+  state.dubSearching = Boolean(state.dubSearching);
 
   return state;
 }
@@ -137,6 +173,11 @@ let state = loadState();
 // Ephemeral per-socket playback reports.
 // They are intentionally NOT persisted to disk.
 const playbackReports = new Map();
+
+// Short-lived server-side cache of anime search results.
+// The client only receives opaque result keys; Kodik links stay authoritative
+// on the backend until a proposal is accepted.
+const animeSearchCache = new Map();
 
 function saveState() {
   state.lastUpdatedAt = Date.now();
@@ -229,6 +270,357 @@ function parseVk(raw) {
   return null;
 }
 
+function parseKodik(raw) {
+  raw = String(raw || "").trim();
+  if (!raw) return null;
+
+  if (raw.startsWith("//")) {
+    raw = `https:${raw}`;
+  }
+
+  let url;
+
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+
+  if (!["https:", "http:"].includes(url.protocol)) {
+    return null;
+  }
+
+  if (!/(^|\.)kodik\.(info|cc|biz)$/i.test(url.hostname)) {
+    return null;
+  }
+
+  if (!url.pathname || url.pathname === "/") {
+    return null;
+  }
+
+  // Discord Activity has /kodik mapped to kodik.info.
+  // Normalize other Kodik player hostnames to that mapped host.
+  url.protocol = "https:";
+  url.hostname = "kodik.info";
+  url.port = "";
+
+  if (!url.searchParams.has("hide_selectors")) {
+    url.searchParams.set("hide_selectors", "true");
+  }
+
+  return {
+    url: url.toString(),
+    kodikPath: `${url.pathname}${url.search}${url.hash || ""}`,
+  };
+}
+
+function normalizeKodikPlayerUrl(raw) {
+  raw = String(raw || "").trim();
+
+  if (!raw) return null;
+
+  if (raw.startsWith("//")) {
+    raw = `https:${raw}`;
+  } else if (raw.startsWith("http://")) {
+    raw = `https://${raw.slice("http://".length)}`;
+  }
+
+  let url;
+
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+
+  if (
+    !/(^|\.)kodik\.(info|cc|biz)$/i.test(url.hostname)
+  ) {
+    return null;
+  }
+
+  // Use the domain that is mapped in Discord Developer Portal.
+  url.protocol = "https:";
+  url.hostname = "kodik.info";
+  url.port = "";
+
+  return url.toString();
+}
+
+function cleanAnimeType(value) {
+  return String(value || "").toLowerCase();
+}
+
+function isAnimeRelease(item) {
+  const type = cleanAnimeType(item?.type || item?.release_type);
+  return type === "anime" || type === "anime-serial";
+}
+
+function animeIdentity(item) {
+  if (item?.shikimori_id) {
+    return `shiki:${item.shikimori_id}`;
+  }
+
+  if (item?.kinopoisk_id) {
+    return `kp:${item.kinopoisk_id}`;
+  }
+
+  const title = String(
+    item?.title_orig || item?.title || ""
+  )
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+
+  return [
+    "title",
+    title,
+    Number(item?.year) || 0,
+    cleanAnimeType(item?.type || item?.release_type),
+  ].join(":");
+}
+
+function normalizeSearchText(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[ё]/g, "е")
+    .replace(/\s+/g, " ");
+}
+
+function animeSearchScore(item, query) {
+  const q = normalizeSearchText(query);
+  const title = normalizeSearchText(item.title);
+  const orig = normalizeSearchText(item.titleOrig);
+  const other = normalizeSearchText(item.otherTitle);
+
+  if (title === q || orig === q || other === q) return 100;
+  if (title.startsWith(q) || orig.startsWith(q)) return 80;
+  if (title.includes(q) || orig.includes(q) || other.includes(q)) {
+    return 60;
+  }
+
+  return 20;
+}
+
+async function kodikSearch(params = {}) {
+  if (!KODIK_API_KEY) {
+    throw new Error(
+      "KODIK_API_KEY не настроен на Bothost."
+    );
+  }
+
+  const query = new URLSearchParams({
+    token: KODIK_API_KEY,
+  });
+
+  for (const [key, value] of Object.entries(params)) {
+    if (
+      value === undefined ||
+      value === null ||
+      value === ""
+    ) {
+      continue;
+    }
+
+    query.set(key, String(value));
+  }
+
+  let response;
+
+  try {
+    response = await fetch(
+      `${KODIK_API_BASE_URL}/search?${query}`,
+      {
+        method: "POST",
+        redirect: "follow",
+        cache: "no-store",
+        headers: {
+          "Accept": "application/json",
+          "Cache-Control": "no-cache",
+        },
+      }
+    );
+  } catch (error) {
+    throw new Error(
+      `Kodik API недоступен: ${error?.message || error}`
+    );
+  }
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(
+      data?.error ||
+      `Kodik API HTTP ${response.status}`
+    );
+  }
+
+  if (data?.error) {
+    throw new Error(String(data.error));
+  }
+
+  return Array.isArray(data?.results)
+    ? data.results
+    : [];
+}
+
+async function searchAnimeTitles(queryText) {
+  queryText = String(queryText || "").trim();
+
+  if (queryText.length < 2) {
+    throw new Error("Введи хотя бы 2 символа.");
+  }
+
+  const params = new URLSearchParams({
+    search: queryText,
+    limit: "8",
+    order: "popularity",
+  });
+
+  let response;
+
+  try {
+    response = await fetch(
+      `${SHIKIMORI_API_BASE_URL}/api/animes?${params}`,
+      {
+        method: "GET",
+        redirect: "follow",
+        cache: "no-store",
+        headers: {
+          "Accept": "application/json",
+          "Cache-Control": "no-cache",
+          "Pragma": "no-cache",
+          "User-Agent":
+            "MovieNightDiscordActivity/2.0 (anime title search)",
+        },
+      }
+    );
+  } catch (error) {
+    throw new Error(
+      `Shikimori недоступен: ${error?.message || error}`
+    );
+  }
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(
+      data?.message ||
+      `Shikimori API HTTP ${response.status}`
+    );
+  }
+
+  if (!Array.isArray(data)) {
+    throw new Error("Shikimori вернул неожиданный ответ.");
+  }
+
+  return data
+    .filter((item) => item?.id && (item?.russian || item?.name))
+    .slice(0, 8)
+    .map((item) => {
+      const airedYear =
+        typeof item.aired_on === "string" &&
+        /^\\d{4}/.test(item.aired_on)
+          ? Number(item.aired_on.slice(0, 4))
+          : null;
+
+      const kind = String(item.kind || "").toLowerCase();
+
+      return {
+        key: `shiki:${item.id}`,
+        title: String(item.russian || item.name || "Аниме"),
+        titleOrig: String(item.name || ""),
+        otherTitle: "",
+        year: airedYear,
+        type: kind === "movie" ? "anime" : "anime-serial",
+        shikimoriId: String(item.id),
+        kinopoiskId: null,
+        episodesCount:
+          Number(item.episodes) ||
+          Number(item.episodes_aired) ||
+          null,
+        translationsCount: null,
+        shikimoriKind: kind,
+      };
+    });
+}
+async function findAnimeTranslationOptions(anime) {
+  if (!KODIK_API_KEY) {
+    return [];
+  }
+
+  const params = {
+    limit: 100,
+    types: "anime,anime-serial",
+  };
+
+  if (anime.shikimoriId) {
+    params.shikimori_id = anime.shikimoriId;
+  } else if (anime.kinopoiskId) {
+    params.kinopoisk_id = anime.kinopoiskId;
+  } else {
+    params.title = anime.title;
+  }
+
+  const releases = await kodikSearch(params);
+
+  const matching = releases.filter((release) => {
+    if (!isAnimeRelease(release)) return false;
+
+    if (anime.shikimoriId) {
+      return String(release.shikimori_id || "") ===
+        String(anime.shikimoriId);
+    }
+
+    if (anime.kinopoiskId) {
+      return String(release.kinopoisk_id || "") ===
+        String(anime.kinopoiskId);
+    }
+
+    return animeIdentity(release) === anime.key;
+  });
+
+  const voice = new Map();
+  const fallback = new Map();
+
+  for (const release of matching) {
+    const link = normalizeKodikPlayerUrl(release.link);
+    const tr = release.translation;
+
+    if (!link || !tr?.id) continue;
+
+    const option = {
+      id: String(tr.id),
+      title: String(tr.title || "Озвучка"),
+      translationType: String(
+        tr.type || tr.translation_type || ""
+      ),
+      link,
+      releaseId: String(release.id || ""),
+      episodesCount:
+        Number(release.episodes_count) ||
+        anime.episodesCount ||
+        null,
+      createdAt: Date.now(),
+    };
+
+    fallback.set(option.id, option);
+
+    if (option.translationType === "voice") {
+      voice.set(option.id, option);
+    }
+  }
+
+  const chosen = voice.size ? voice : fallback;
+
+  return [...chosen.values()]
+    .sort((a, b) =>
+      a.title.localeCompare(b.title, "ru")
+    )
+    .slice(0, 30);
+}
+
 function parseTime(value) {
   value = String(value || "").trim();
 
@@ -266,7 +658,13 @@ function formatTime(seconds) {
 }
 
 function movieKey(movie) {
-  return movie ? `${movie.oid}_${movie.id}_${movie.hash || ""}` : "";
+  if (!movie) return "";
+
+  if (movie.source === "KODIK") {
+    return `kodik:${movie.url || movie.kodikPath || ""}`;
+  }
+
+  return `vk:${movie.oid}_${movie.id}_${movie.hash || ""}`;
 }
 
 function sanitizeStateFor(userId) {
@@ -282,9 +680,34 @@ function sanitizeStateFor(userId) {
 
   const suggestions = state.suggestions.map((item) => ({
     id: item.id,
+    kind: item.kind || "MOVIE",
     title: item.title,
+    year: item.year || null,
+    episodesCount: item.episodesCount || null,
     proposerName: item.proposerName,
     votes: counts.get(item.id) || 0,
+  }));
+
+  const dubCounts = new Map();
+
+  for (const option of state.dubOptions) {
+    dubCounts.set(option.id, 0);
+  }
+
+  for (const optionId of Object.values(state.dubVotes)) {
+    dubCounts.set(
+      optionId,
+      (dubCounts.get(optionId) || 0) + 1
+    );
+  }
+
+  const dubOptions = state.dubOptions.map((item) => ({
+    id: item.id,
+    title: item.title,
+    translationType: item.translationType,
+    provider: item.provider || "Kodik",
+    episode: Number(item.episode) || 1,
+    votes: dubCounts.get(item.id) || 0,
   }));
 
   const mySuggestion = state.suggestions.find(
@@ -297,10 +720,29 @@ function sanitizeStateFor(userId) {
     positionSeconds: state.positionSeconds,
     startedAt: state.startedAt,
     autoStartAt: state.autoStartAt,
+    seekRevision: Number(state.seekRevision) || 0,
+
     voteEndsAt: state.voteEndsAt,
     suggestions,
     mySuggestionId: mySuggestion?.id || null,
     myVote: state.votes[userId] || null,
+
+    dubVoteEndsAt: state.dubVoteEndsAt,
+    animeWinner: state.animeWinner
+      ? {
+          title: state.animeWinner.title,
+          titleOrig: state.animeWinner.titleOrig || "",
+          year: state.animeWinner.year || null,
+          episodesCount:
+            state.animeWinner.episodesCount || null,
+        }
+      : null,
+    dubOptions,
+    myDubVote: state.dubVotes[userId] || null,
+    dubSearching: Boolean(state.dubSearching),
+
+    notice: state.notice || null,
+
     serverNow: Date.now(),
     lateJoinPreloadSeconds: LATE_JOIN_PRELOAD_SECONDS,
   };
@@ -315,6 +757,346 @@ app.get("/health", (_req, res) => {
     service: "movie-night",
     time: Date.now(),
   });
+});
+
+
+function decodeVkEmbedUrl(value) {
+  return String(value || "")
+    .replaceAll("\\/", "/")
+    .replaceAll("\\u0026", "&")
+    .replaceAll("&amp;", "&");
+}
+
+function extractVkEmbedMp4Files(html) {
+  const files = {};
+
+  for (const quality of [
+    "144",
+    "240",
+    "360",
+    "480",
+    "720",
+    "1080",
+    "1440",
+    "2160",
+  ]) {
+    const match = String(html || "").match(
+      new RegExp(`"mp4_${quality}"\\s*:\\s*"([^"]+)"`, "i")
+    );
+
+    if (match) {
+      files[`mp4_${quality}`] = decodeVkEmbedUrl(match[1]);
+    }
+  }
+
+  return files;
+}
+
+function validVkOid(value) {
+  return /^-?\d+$/.test(String(value || ""));
+}
+
+function validVkVideoId(value) {
+  return /^\d+$/.test(String(value || ""));
+}
+
+function validVkHash(value) {
+  return (
+    value == null ||
+    value === "" ||
+    /^[a-zA-Z0-9_-]{1,256}$/.test(String(value))
+  );
+}
+
+app.get("/api/vk-meta", async (req, res) => {
+  const oid = String(req.query.oid || "");
+  const id = String(req.query.id || "");
+  const hash = req.query.hash == null
+    ? null
+    : String(req.query.hash);
+
+  if (
+    !validVkOid(oid) ||
+    !validVkVideoId(id) ||
+    !validVkHash(hash)
+  ) {
+    res.status(400).json({
+      error: "Invalid VK video parameters",
+    });
+    return;
+  }
+
+  const params = new URLSearchParams({
+    oid,
+    id,
+    hd: "4",
+    autoplay: "0",
+    js_api: "1",
+  });
+
+  if (hash) {
+    params.set("hash", hash);
+  }
+
+  const url = `https://vk.com/video_ext.php?${params}`;
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      cache: "no-store",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+          "AppleWebKit/537.36 (KHTML, like Gecko) " +
+          "Chrome/140.0.0.0 Safari/537.36",
+        "Accept":
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": "https://vkvideo.ru/",
+      },
+    });
+
+    const html = await response.text();
+
+    if (!response.ok) {
+      console.warn(
+        `⚠️ Backend VK metadata HTTP ${response.status} for ${oid}_${id}`
+      );
+
+      res.status(502).json({
+        error: `VK metadata HTTP ${response.status}`,
+      });
+      return;
+    }
+
+    const files = extractVkEmbedMp4Files(html);
+
+    if (!Object.keys(files).length) {
+      console.warn(
+        `⚠️ Backend VK metadata returned no MP4 for ${oid}_${id}`
+      );
+
+      res.status(502).json({
+        error: "VK metadata returned no MP4",
+      });
+      return;
+    }
+
+    console.log(
+      `✅ Fresh backend VK metadata ${oid}_${id}: ` +
+      `${Object.keys(files).join(", ")}`
+    );
+
+    res.setHeader(
+      "Cache-Control",
+      "no-store, no-cache, must-revalidate"
+    );
+    res.setHeader("Pragma", "no-cache");
+
+    res.json({
+      ok: true,
+      files,
+    });
+  } catch (error) {
+    console.error(
+      "❌ /api/vk-meta:",
+      error?.message || error
+    );
+
+    res.status(502).json({
+      error: "VK metadata fetch failed",
+    });
+  }
+});
+
+function isAllowedVkMediaHost(hostname) {
+  hostname = String(hostname || "").toLowerCase();
+
+  return (
+    hostname.endsWith(".okcdn.ru") ||
+    hostname.endsWith(".vkuser.net")
+  );
+}
+
+let activeMediaRelayRequests = 0;
+let mediaRelayRequestSerial = 0;
+
+app.get("/api/media", async (req, res) => {
+  let mediaUrl;
+
+  try {
+    mediaUrl = new URL(String(req.query.url || ""));
+  } catch {
+    res.status(400).send("Bad media URL");
+    return;
+  }
+
+  if (
+    mediaUrl.protocol !== "https:" ||
+    !isAllowedVkMediaHost(mediaUrl.hostname)
+  ) {
+    res.status(403).send("Media host is not allowed");
+    return;
+  }
+
+  const relayId = ++mediaRelayRequestSerial;
+  activeMediaRelayRequests += 1;
+
+  console.log(
+    `📡 MEDIA relay#${relayId} open active=${activeMediaRelayRequests} ` +
+    `host=${mediaUrl.hostname} range=${req.headers.range || "none"}`
+  );
+
+  let relayCountClosed = false;
+
+  const markRelayClosed = (reason) => {
+    if (relayCountClosed) return;
+    relayCountClosed = true;
+    activeMediaRelayRequests = Math.max(
+      0,
+      activeMediaRelayRequests - 1
+    );
+
+    console.log(
+      `📡 MEDIA relay#${relayId} close active=${activeMediaRelayRequests} ` +
+      `reason=${reason}`
+    );
+  };
+
+  const controller = new AbortController();
+
+  const abortUpstream = () => {
+    try {
+      controller.abort();
+    } catch {}
+  };
+
+  req.on("aborted", () => {
+    markRelayClosed("request-aborted");
+    abortUpstream();
+  });
+
+  res.on("finish", () => {
+    markRelayClosed("finish");
+  });
+
+  res.on("close", () => {
+    markRelayClosed(
+      res.writableEnded ? "close-after-end" : "client-close"
+    );
+
+    if (!res.writableEnded) {
+      abortUpstream();
+    }
+  });
+
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",
+    "Referer": "https://vkvideo.ru/",
+  };
+
+  if (req.headers.range) {
+    headers.Range = req.headers.range;
+  }
+
+  try {
+    const upstream = await fetch(mediaUrl, {
+      method: "GET",
+      redirect: "follow",
+      cache: "no-store",
+      headers,
+      signal: controller.signal,
+    });
+
+    console.log(
+      `📡 MEDIA relay#${relayId} upstream=${upstream.status} ` +
+      `type=${upstream.headers.get("content-type") || "-"} ` +
+      `length=${upstream.headers.get("content-length") || "-"} ` +
+      `range=${upstream.headers.get("content-range") || "-"}`
+    );
+
+    if (!upstream.ok && upstream.status !== 206) {
+      console.warn(
+        `⚠️ Media relay HTTP ${upstream.status}: ${mediaUrl.hostname}`
+      );
+
+      markRelayClosed(`upstream-http-${upstream.status}`);
+
+      res
+        .status(upstream.status)
+        .send(`VK media upstream HTTP ${upstream.status}`);
+
+      return;
+    }
+
+    for (const name of [
+      "content-type",
+      "content-length",
+      "content-range",
+      "accept-ranges",
+      "etag",
+      "last-modified",
+    ]) {
+      const value = upstream.headers.get(name);
+      if (value) res.setHeader(name, value);
+    }
+
+    res.setHeader(
+      "Cache-Control",
+      "no-store, no-cache, must-revalidate"
+    );
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("X-Movie-Night-Media-Relay", "1");
+    res.setHeader("X-Accel-Buffering", "no");
+
+    res.status(upstream.status);
+
+    if (!upstream.body) {
+      res.end();
+      return;
+    }
+
+    Readable.fromWeb(upstream.body)
+      .on("error", (error) => {
+        if (error?.name !== "AbortError") {
+          console.error(
+            "❌ Media relay stream:",
+            error?.message || error
+          );
+        }
+
+        if (res.headersSent) {
+          res.destroy();
+        } else {
+          res.status(502).end();
+        }
+      })
+      .pipe(res);
+  } catch (error) {
+    markRelayClosed(
+      error?.name === "AbortError"
+        ? "abort-error"
+        : "relay-error"
+    );
+
+    if (error?.name === "AbortError") return;
+
+    console.error(
+      "❌ /api/media:",
+      error?.message || error
+    );
+
+    if (!res.headersSent) {
+      res.status(502).send("VK media relay failed");
+    }
+  }
 });
 
 // Production: Vite is built into ./dist and served by the same Express app.
@@ -371,11 +1153,22 @@ async function setVoiceStatus(status) {
 
 function desiredVoiceStatus() {
   if (state.phase === "WATCHING" || state.phase === "PAUSED") {
-    return `Смотрим: ${state.movie?.title || "фильм"}`;
+    const prefix =
+      state.movie?.source === "KODIK"
+        ? "Смотрим аниме"
+        : "Смотрим";
+
+    return `${prefix}: ${state.movie?.title || "видео"}`;
   }
 
   if (state.phase === "VOTING") {
-    return "Выбираем следующий фильм";
+    return "Выбираем фильм или аниме";
+  }
+
+  if (state.phase === "DUB_VOTING") {
+    return `Выбираем озвучку: ${
+      state.animeWinner?.title || "аниме"
+    }`;
   }
 
   return null;
@@ -667,6 +1460,7 @@ async function startMovie(title, rawUrl) {
     ...defaultState(),
     phase: "PAUSED",
     movie: {
+      source: "VK",
       title: String(title || "").trim().slice(0, 100),
       url: parsed.url,
       oid: parsed.oid,
@@ -681,6 +1475,49 @@ async function startMovie(title, rawUrl) {
 
   console.log(
     `⏳ Предзагрузка: ${state.movie.title}. Автостарт через ${MOVIE_PRELOAD_SECONDS} сек.`
+  );
+
+  saveState();
+  broadcastState();
+  await syncVoiceStatus();
+}
+
+async function startAnime(title, rawUrl, extra = {}) {
+  const parsed = parseKodik(rawUrl);
+
+  if (!parsed) {
+    throw new Error(
+      "Нужна ссылка на официальный Kodik player вида https://kodik.info/..."
+    );
+  }
+
+  const autoStartAt = Date.now() + MOVIE_PRELOAD_SECONDS * 1000;
+
+  playbackReports.clear();
+
+  state = {
+    ...defaultState(),
+    phase: "PAUSED",
+    movie: {
+      source: "KODIK",
+      title: String(title || "").trim().slice(0, 100),
+      url: parsed.url,
+      kodikPath: parsed.kodikPath,
+      dubTitle: extra.dubTitle
+        ? String(extra.dubTitle).slice(0, 100)
+        : null,
+      animeKey: extra.animeKey || null,
+      duration: null,
+    },
+    positionSeconds: 0,
+    startedAt: null,
+    autoStartAt,
+  };
+
+  console.log(
+    `🍥 Anime preload: ${state.movie.title}. ` +
+    `Kodik=${state.movie.kodikPath}. ` +
+    `Автостарт через ${MOVIE_PRELOAD_SECONDS} сек.`
   );
 
   saveState();
@@ -760,10 +1597,15 @@ async function seekMovie(seconds) {
   }
 
   state.positionSeconds = seconds;
+  state.seekRevision = (Number(state.seekRevision) || 0) + 1;
 
   if (state.phase === "WATCHING") {
     state.startedAt = Date.now();
   }
+
+  console.log(
+    `⏩ Seek revision=${state.seekRevision} -> ${formatTime(seconds)}`
+  );
 
   saveState();
   broadcastState();
@@ -784,6 +1626,330 @@ async function startVoting() {
   broadcastState();
   await syncVoiceStatus();
 }
+
+function runExecFile(file, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      file,
+      args,
+      options,
+      (error, stdout, stderr) => {
+        if (stderr?.trim()) {
+          console.log(
+            `🍥 Anime helper: ${stderr.trim().slice(0, 4000)}`
+          );
+        }
+
+        if (error) {
+          error.stdout = stdout;
+          error.stderr = stderr;
+          reject(error);
+          return;
+        }
+
+        resolve({ stdout, stderr });
+      }
+    );
+  });
+}
+
+async function discoverAutomaticDubOptions(anime) {
+  const args = [
+    path.join(ROOT, "anime_sources.py"),
+    "--title",
+    String(anime.title || ""),
+    "--orig",
+    String(anime.titleOrig || ""),
+  ];
+
+  if (anime.year) {
+    args.push("--year", String(anime.year));
+  }
+
+  console.log(
+    `🔎 Auto dub search: ${anime.title} ` +
+    `(Shikimori=${anime.shikimoriId || "-"}, year=${anime.year || "-"})`
+  );
+
+  let stdout = "";
+
+  try {
+    const result = await runExecFile(
+      "python3",
+      args,
+      {
+        cwd: ROOT,
+        timeout: 45_000,
+        maxBuffer: 2 * 1024 * 1024,
+        env: {
+          ...process.env,
+          PYTHONUNBUFFERED: "1",
+        },
+      }
+    );
+
+    stdout = result.stdout;
+  } catch (error) {
+    // The helper intentionally exits non-zero when no sources were found.
+    // Its JSON stdout still contains a useful reason, so parse it first.
+    stdout = String(error?.stdout || "");
+
+    if (!stdout.trim()) {
+      throw new Error(
+        `Автопоиск озвучек не запустился: ${
+          error?.killed
+            ? "таймаут 45 секунд"
+            : error?.message || error
+        }`
+      );
+    }
+  }
+
+  let data;
+
+  try {
+    data = JSON.parse(stdout.trim());
+  } catch {
+    throw new Error(
+      "Автопоиск озвучек вернул некорректный ответ."
+    );
+  }
+
+  if (!data?.ok || !Array.isArray(data.options)) {
+    throw new Error(
+      data?.error ||
+      "AnimeGo не вернул Kodik-озвучки."
+    );
+  }
+
+  const options = [];
+  const seen = new Set();
+
+  for (const raw of data.options) {
+    const parsed = parseKodik(raw?.url);
+
+    if (!parsed) continue;
+
+    const title = String(raw?.title || "Озвучка")
+      .trim()
+      .slice(0, 100);
+
+    const key = `${title.toLowerCase()}|${parsed.url}`;
+
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    options.push({
+      id: crypto.randomUUID(),
+      title,
+      translationType: "voice",
+      link: parsed.url,
+      releaseId: null,
+      episodesCount: anime.episodesCount || null,
+      episode: Number(raw?.episode) || 1,
+      provider: String(raw?.provider || "AnimeGo/Kodik"),
+      proposerUserId: null,
+      proposerName: null,
+      manual: false,
+      createdAt: Date.now() + options.length,
+    });
+  }
+
+  if (!options.length) {
+    throw new Error(
+      "Нашлись источники, но среди них нет поддерживаемых Kodik-ссылок."
+    );
+  }
+
+  console.log(
+    `✅ Auto dub search: ${anime.title} -> ${options.length} Kodik variants`
+  );
+
+  return options;
+}
+
+async function populateDubOptions({ isRetry = false } = {}) {
+  if (state.phase !== "DUB_VOTING" || !state.animeWinner) {
+    return false;
+  }
+
+  const animeKey = state.animeWinner.key;
+  const anime = { ...state.animeWinner };
+
+  state.dubSearching = true;
+  state.dubVoteEndsAt = null;
+  state.dubOptions = [];
+  state.dubVotes = {};
+  state.notice = isRetry
+    ? "Повторно ищу доступные Kodik-озвучки…"
+    : "Ищу доступные Kodik-озвучки автоматически…";
+
+  saveState();
+  broadcastState();
+
+  let options = [];
+  let discoveryError = null;
+
+  try {
+    options = await discoverAutomaticDubOptions(anime);
+  } catch (error) {
+    discoveryError = error;
+    console.warn(
+      `⚠️ Auto dub search failed for ${anime.title}:`,
+      error?.message || error
+    );
+  }
+
+  // The room could have moved to another phase while the scraper was working.
+  if (
+    state.phase !== "DUB_VOTING" ||
+    state.animeWinner?.key !== animeKey
+  ) {
+    return false;
+  }
+
+  // If the owner later configures an official Kodik API key, keep it as a
+  // secondary fallback. No key is required for the normal path.
+  if (!options.length && KODIK_API_KEY) {
+    try {
+      options = await findAnimeTranslationOptions(anime);
+      console.log(
+        `✅ Official Kodik fallback -> ${options.length} variants`
+      );
+    } catch (error) {
+      console.warn(
+        "⚠️ Official Kodik fallback failed:",
+        error?.message || error
+      );
+    }
+  }
+
+  state.dubSearching = false;
+  state.dubOptions = options;
+  state.dubVotes = {};
+
+  if (options.length) {
+    state.notice = null;
+    state.dubVoteEndsAt =
+      Date.now() + DUB_VOTING_DURATION_SECONDS * 1000;
+  } else {
+    state.notice =
+      `Не удалось автоматически найти Kodik-озвучки. ${
+        discoveryError?.message || "Источник временно недоступен."
+      } Нажми «Повторить поиск».`;
+
+    state.dubVoteEndsAt = null;
+  }
+
+  saveState();
+  broadcastState();
+  return options.length > 0;
+}
+
+async function startDubVoting(animeSuggestion) {
+  const anime = {
+    key: animeSuggestion.animeKey,
+    title: animeSuggestion.title,
+    titleOrig: animeSuggestion.titleOrig || "",
+    year: animeSuggestion.year || null,
+    type: animeSuggestion.animeType || null,
+    shikimoriId: animeSuggestion.shikimoriId || null,
+    kinopoiskId: animeSuggestion.kinopoiskId || null,
+    episodesCount: animeSuggestion.episodesCount || null,
+  };
+
+  playbackReports.clear();
+
+  state = {
+    ...defaultState(),
+    phase: "DUB_VOTING",
+    animeWinner: anime,
+    dubVoteEndsAt: null,
+    dubOptions: [],
+    dubVotes: {},
+    dubSearching: true,
+    notice: "Ищу доступные Kodik-озвучки автоматически…",
+  };
+
+  console.log(
+    `🎙 Anime won: ${anime.title}. Starting automatic dub discovery.`
+  );
+
+  saveState();
+  broadcastState();
+  await syncVoiceStatus();
+
+  // Keep the room in DUB_VOTING while discovery happens, so clients see a
+  // clear loading state instead of remaining on the expired main vote.
+  await populateDubOptions();
+}
+
+
+function chooseDubWinner() {
+  if (!state.dubOptions.length) return null;
+
+  const counts = new Map();
+
+  for (const item of state.dubOptions) {
+    counts.set(item.id, 0);
+  }
+
+  for (const optionId of Object.values(state.dubVotes)) {
+    counts.set(
+      optionId,
+      (counts.get(optionId) || 0) + 1
+    );
+  }
+
+  return [...state.dubOptions].sort((a, b) => {
+    const diff =
+      (counts.get(b.id) || 0) -
+      (counts.get(a.id) || 0);
+
+    if (diff !== 0) return diff;
+
+    return Number(a.createdAt || 0) - Number(b.createdAt || 0);
+  })[0];
+}
+
+async function finishDubVoting() {
+  if (state.phase !== "DUB_VOTING") {
+    throw new Error(
+      "Сейчас нет голосования за озвучку."
+    );
+  }
+
+  if (state.dubSearching) {
+    throw new Error(
+      "Поиск озвучек ещё не завершён."
+    );
+  }
+
+  const anime = state.animeWinner;
+  const winner = chooseDubWinner();
+
+  if (!anime) {
+    throw new Error("Аниме для голосования потеряно.");
+  }
+
+  if (!winner) {
+    throw new Error(
+      "Нет доступных Kodik-озвучек. Нажми «Повторить поиск»."
+    );
+  }
+
+  await startAnime(
+    anime.title,
+    winner.link,
+    {
+      dubTitle: winner.title,
+      animeKey: anime.key,
+    }
+  );
+
+  return winner;
+}
+
 
 async function stopSession() {
   playbackReports.clear();
@@ -828,6 +1994,11 @@ async function finishVoting({ extendIfEmpty = true } = {}) {
     saveState();
     broadcastState();
     return null;
+  }
+
+  if (winner.kind === "ANIME") {
+    await startDubVoting(winner);
+    return winner;
   }
 
   await startMovie(winner.title, winner.url);
@@ -892,18 +2063,73 @@ function commandDefinition() {
     );
 }
 
+function animeCommandDefinition() {
+  return new SlashCommandBuilder()
+    .setName("anime")
+    .setDescription("Совместный просмотр аниме через Kodik")
+    .addSubcommand((sub) =>
+      sub
+        .setName("start")
+        .setDescription("Запустить аниме через Kodik")
+        .addStringOption((opt) =>
+          opt
+            .setName("title")
+            .setDescription("Название аниме / серии")
+            .setRequired(true)
+            .setMaxLength(100)
+        )
+        .addStringOption((opt) =>
+          opt
+            .setName("url")
+            .setDescription("Ссылка Kodik Player (kodik.info)")
+            .setRequired(true)
+        )
+    )
+    .addSubcommand((sub) =>
+      sub.setName("pause").setDescription("Поставить аниме на паузу")
+    )
+    .addSubcommand((sub) =>
+      sub.setName("resume").setDescription("Продолжить аниме")
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName("seek")
+        .setDescription("Перемотать аниме у всех")
+        .addStringOption((opt) =>
+          opt
+            .setName("time")
+            .setDescription("Например: 12:30 или 750")
+            .setRequired(true)
+        )
+    )
+    .addSubcommand((sub) =>
+      sub.setName("stop").setDescription("Остановить просмотр аниме")
+    )
+    .addSubcommand((sub) =>
+      sub.setName("status").setDescription("Показать состояние anime-сессии")
+    );
+}
+
 async function registerMovieCommand() {
   const guild = await bot.guilds.fetch(GUILD_ID);
   const commands = await guild.commands.fetch();
-  const existing = commands.find((command) => command.name === "movie");
-  const body = commandDefinition().toJSON();
 
-  if (existing) {
-    await guild.commands.edit(existing.id, body);
-    console.log("✅ /movie обновлена");
-  } else {
-    await guild.commands.create(body);
-    console.log("✅ /movie зарегистрирована");
+  for (const definition of [
+    commandDefinition(),
+    animeCommandDefinition(),
+  ]) {
+    const body = definition.toJSON();
+    const existing = commands.find(
+      (command) => command.name === body.name
+    );
+
+    if (existing) {
+      await guild.commands.edit(existing.id, body);
+      console.log(`✅ /${body.name} обновлена`);
+    } else {
+      await guild.commands.create(body);
+      console.log(`✅ /${body.name} зарегистрирована`);
+    }
   }
 }
 
@@ -960,6 +2186,10 @@ async function getDiscordUserFromBearer(accessToken) {
   return response.json();
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function getActivityInstance(instanceId) {
   const response = await fetch(
     `https://discord.com/api/v10/applications/${CLIENT_ID}/activity-instances/${encodeURIComponent(instanceId)}`,
@@ -975,6 +2205,55 @@ async function getActivityInstance(instanceId) {
   }
 
   return response.json();
+}
+
+async function getActivityInstanceForJoiningUser(instanceId, userId) {
+  let lastInstance = null;
+  let lastError = null;
+
+  // A user can open an already-running Activity before Discord's REST
+  // representation of the instance has caught up. Do not reject that user
+  // on the first request. Give Discord a short window to expose the new
+  // participant in the instance.
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    try {
+      const instance = await getActivityInstance(instanceId);
+      lastInstance = instance;
+      lastError = null;
+
+      if (
+        !Array.isArray(instance.users) ||
+        instance.users.includes(userId)
+      ) {
+        if (attempt > 1) {
+          console.log(
+            `✅ Activity instance participant appeared after ${attempt} checks: ${userId}`
+          );
+        }
+
+        return instance;
+      }
+
+      console.log(
+        `⏳ Activity instance participant not visible yet (${attempt}/8): ${userId}`
+      );
+    } catch (error) {
+      lastError = error;
+      console.log(
+        `⏳ Activity instance verification retry (${attempt}/8): ${error.message || error}`
+      );
+    }
+
+    if (attempt < 8) {
+      await sleep(750);
+    }
+  }
+
+  // If we successfully fetched an instance, return it so the normal strict
+  // validation below can produce the correct rejection reason.
+  if (lastInstance) return lastInstance;
+
+  throw lastError || new Error("Activity instance недоступен.");
 }
 
 io.use(async (socket, next) => {
@@ -996,10 +2275,12 @@ io.use(async (socket, next) => {
       throw new Error("Activity должна быть открыта в настроенном войсе.");
     }
 
-    const [user, instance] = await Promise.all([
-      getDiscordUserFromBearer(accessToken),
-      getActivityInstance(instanceId),
-    ]);
+    const user = await getDiscordUserFromBearer(accessToken);
+
+    const instance = await getActivityInstanceForJoiningUser(
+      instanceId,
+      user.id
+    );
 
     if (instance.application_id !== CLIENT_ID) {
       throw new Error("Неверный application instance.");
@@ -1032,7 +2313,11 @@ io.use(async (socket, next) => {
     next();
   } catch (error) {
     console.error("Socket auth denied:", error.message);
-    next(new Error("Activity session verification failed"));
+    next(
+      new Error(
+        `Activity session verification failed: ${error.message || "unknown"}`
+      )
+    );
   }
 });
 
@@ -1046,6 +2331,29 @@ io.on("connection", (socket) => {
   // server clock offset from the midpoint of the request.
   socket.on("time:sync", (_payload = {}, ack = () => {}) => {
     ack({ serverNow: Date.now() });
+  });
+
+  socket.on("player:diagnostic", (report = {}) => {
+    const stage = String(report.stage || "").slice(0, 80);
+    const key = String(report.movieKey || "").slice(0, 100);
+    const quality = Number(report.quality) || "-";
+    const mode = String(report.mode || "-").slice(0, 60);
+    const error = String(report.error || "").slice(0, 180);
+    const readyState = Number.isFinite(Number(report.readyState))
+      ? Number(report.readyState)
+      : "-";
+    const networkState = Number.isFinite(Number(report.networkState))
+      ? Number(report.networkState)
+      : "-";
+
+    if (!stage) return;
+
+    console.log(
+      `🎞 PLAYER ${user.global_name || user.username} (${user.id}) ` +
+      `stage=${stage} q=${quality} mode=${mode} ` +
+      `ready=${readyState} network=${networkState}` +
+      (error ? ` error="${error}"` : "")
+    );
   });
 
   socket.on("playback:progress", (report = {}) => {
@@ -1115,6 +2423,143 @@ io.on("connection", (socket) => {
     );
   });
 
+  socket.on("anime:search", async ({ query } = {}, ack = () => {}) => {
+    try {
+      if (state.phase !== "VOTING") {
+        throw new Error(
+          "Искать аниме можно во время общего голосования."
+        );
+      }
+
+      if (
+        state.suggestions.some(
+          (item) => item.proposerUserId === user.id
+        )
+      ) {
+        throw new Error(
+          "Ты уже предложил вариант."
+        );
+      }
+
+      const results = await searchAnimeTitles(query);
+
+      const searchId = crypto.randomUUID();
+      const items = new Map();
+
+      for (const item of results) {
+        items.set(item.key, item);
+      }
+
+      animeSearchCache.set(socket.id, {
+        searchId,
+        expiresAt: Date.now() + 5 * 60 * 1000,
+        items,
+      });
+
+      ack({
+        ok: true,
+        searchId,
+        results: results.map((item) => ({
+          key: item.key,
+          title: item.title,
+          titleOrig: item.titleOrig,
+          year: item.year,
+          type: item.type,
+          episodesCount: item.episodesCount,
+          translationsCount: item.translationsCount,
+        })),
+      });
+    } catch (error) {
+      ack({
+        ok: false,
+        error: error?.message || String(error),
+      });
+    }
+  });
+
+  socket.on(
+    "vote:suggest-anime",
+    ({ searchId, resultKey } = {}, ack = () => {}) => {
+      try {
+        if (state.phase !== "VOTING") {
+          throw new Error("Сейчас нет общего голосования.");
+        }
+
+        if (
+          state.suggestions.some(
+            (item) => item.proposerUserId === user.id
+          )
+        ) {
+          throw new Error(
+            "Можно предложить только один вариант."
+          );
+        }
+
+        const cached = animeSearchCache.get(socket.id);
+
+        if (
+          !cached ||
+          cached.searchId !== String(searchId || "") ||
+          cached.expiresAt < Date.now()
+        ) {
+          throw new Error(
+            "Результаты поиска устарели. Нажми «Найти» ещё раз."
+          );
+        }
+
+        const anime = cached.items.get(
+          String(resultKey || "")
+        );
+
+        if (!anime) {
+          throw new Error(
+            "Это аниме больше не найдено в текущем поиске."
+          );
+        }
+
+        if (
+          state.suggestions.some(
+            (item) =>
+              item.kind === "ANIME" &&
+              item.animeKey === anime.key
+          )
+        ) {
+          throw new Error(
+            "Это аниме уже предложено."
+          );
+        }
+
+        state.suggestions.push({
+          id: crypto.randomUUID(),
+          kind: "ANIME",
+          title: anime.title,
+          titleOrig: anime.titleOrig,
+          year: anime.year,
+          episodesCount: anime.episodesCount,
+          animeType: anime.type,
+          animeKey: anime.key,
+          shikimoriId: anime.shikimoriId,
+          kinopoiskId: anime.kinopoiskId,
+          proposerUserId: user.id,
+          proposerName:
+            user.global_name || user.username,
+          createdAt: Date.now(),
+        });
+
+        animeSearchCache.delete(socket.id);
+
+        saveState();
+        broadcastState();
+        ack({ ok: true });
+      } catch (error) {
+        ack({
+          ok: false,
+          error: error?.message || String(error),
+        });
+      }
+    }
+  );
+
   socket.on("vote:suggest", async ({ title, url } = {}, ack = () => {}) => {
     try {
       if (state.phase !== "VOTING") {
@@ -1150,6 +2595,7 @@ io.on("connection", (socket) => {
 
       state.suggestions.push({
         id: crypto.randomUUID(),
+        kind: "MOVIE",
         title,
         url,
         oid: parsed.oid,
@@ -1189,8 +2635,76 @@ io.on("connection", (socket) => {
     }
   });
 
+
+  socket.on(
+    "anime:refresh-dubs",
+    async (_payload = {}, ack = () => {}) => {
+      try {
+        if (state.phase !== "DUB_VOTING") {
+          throw new Error(
+            "Сейчас нет голосования за озвучку."
+          );
+        }
+
+        if (state.dubSearching) {
+          throw new Error(
+            "Поиск озвучек уже выполняется."
+          );
+        }
+
+        ack({ ok: true, started: true });
+
+        await populateDubOptions({
+          isRetry: true,
+        });
+      } catch (error) {
+        ack({
+          ok: false,
+          error: error?.message || String(error),
+        });
+      }
+    }
+  );
+
+  socket.on(
+    "vote:dub-cast",
+    ({ optionId } = {}, ack = () => {}) => {
+      try {
+        if (state.phase !== "DUB_VOTING") {
+          throw new Error(
+            "Сейчас нет голосования за озвучку."
+          );
+        }
+
+        optionId = String(optionId || "");
+
+        if (
+          !state.dubOptions.some(
+            (item) => item.id === optionId
+          )
+        ) {
+          throw new Error(
+            "Такой озвучки больше нет."
+          );
+        }
+
+        state.dubVotes[user.id] = optionId;
+
+        saveState();
+        broadcastState();
+        ack({ ok: true });
+      } catch (error) {
+        ack({
+          ok: false,
+          error: error?.message || String(error),
+        });
+      }
+    }
+  );
+
   socket.on("disconnect", () => {
     playbackReports.delete(socket.id);
+    animeSearchCache.delete(socket.id);
     console.log(
       `🔴 Activity ушёл: ${user.global_name || user.username} (${user.id})`
     );
@@ -1199,49 +2713,152 @@ io.on("connection", (socket) => {
 
 bot.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName !== "movie") return;
+
+  if (
+    interaction.commandName !== "movie" &&
+    interaction.commandName !== "anime"
+  ) {
+    return;
+  }
 
   const sub = interaction.options.getSubcommand();
+  const isAnimeCommand = interaction.commandName === "anime";
 
-  // /movie status is readable by everyone.
+  // status is readable by everyone.
   if (sub !== "status" && !hasControlRole(interaction)) {
     await deny(interaction);
     return;
   }
 
+  // Discord invalidates an interaction if it does not receive an initial
+  // response within 3 seconds. Some Movie Night operations (especially
+  // anime winner -> automatic dub discovery) can take much longer, so ACK
+  // every authorized slash command immediately and edit the response later.
   try {
+    await interaction.deferReply({
+          });
+  } catch (error) {
+    console.error(
+      "Command defer failed:",
+      error?.message || error
+    );
+    return;
+  }
+
+  try {
+    if (isAnimeCommand) {
+      if (sub === "start") {
+        const title = interaction.options.getString("title", true);
+        const url = interaction.options.getString("url", true);
+
+        await startAnime(title, url);
+
+        await interaction.editReply({
+          content:
+            `🍥 **${title}** загружается через Kodik. ` +
+            `Общий старт через **${formatTime(MOVIE_PRELOAD_SECONDS)}**.`,
+                  });
+        return;
+      }
+
+      if (sub === "pause") {
+        await pauseMovie();
+
+        await interaction.editReply({
+          content: `⏸ Аниме на паузе: ${formatTime(state.positionSeconds)}`,
+                  });
+        return;
+      }
+
+      if (sub === "resume") {
+        await resumeMovie();
+
+        await interaction.editReply({
+          content: "▶ Просмотр аниме продолжен.",
+                  });
+        return;
+      }
+
+      if (sub === "seek") {
+        const raw = interaction.options.getString("time", true);
+        const seconds = parseTime(raw);
+
+        if (seconds == null) {
+          throw new Error(
+            "Формат времени: 12:30, 1:02:30 или число секунд."
+          );
+        }
+
+        await seekMovie(seconds);
+
+        await interaction.editReply({
+          content: `⏩ Аниме перемотано на ${formatTime(seconds)}`,
+                  });
+        return;
+      }
+
+      if (sub === "stop") {
+        await stopSession();
+
+        await interaction.editReply({
+          content: "⏹ Anime-сессия остановлена.",
+                  });
+        return;
+      }
+
+      if (sub === "status") {
+        if (state.movie?.source !== "KODIK") {
+          await interaction.editReply({
+            content: "Сейчас Kodik-аниме не запущено.",
+                      });
+          return;
+        }
+
+        const pos = currentPosition();
+        const duration = state.movie?.duration;
+
+        await interaction.editReply({
+          content:
+            `🍥 **${state.movie?.title || "Аниме"}**\n` +
+            `${state.phase === "PAUSED" ? "⏸" : "▶"} ` +
+            `${formatTime(pos)}` +
+            `${duration ? ` / ${formatTime(duration)}` : ""}`,
+                  });
+        return;
+      }
+
+      return;
+    }
+
     if (sub === "start") {
       const title = interaction.options.getString("title", true);
       const url = interaction.options.getString("url", true);
 
       await startMovie(title, url);
 
-      await interaction.reply({
+      await interaction.editReply({
         content:
           `⏳ **${title}** загружается у всех. ` +
           `Автостарт через **${formatTime(MOVIE_PRELOAD_SECONDS)}**.`,
-        flags: MessageFlags.Ephemeral,
-      });
+              });
       return;
     }
 
     if (sub === "pause") {
       await pauseMovie();
 
-      await interaction.reply({
+      await interaction.editReply({
         content: `⏸ Пауза на ${formatTime(state.positionSeconds)}`,
-        flags: MessageFlags.Ephemeral,
-      });
+              });
       return;
     }
 
     if (sub === "resume") {
       await resumeMovie();
 
-      await interaction.reply({
+      await interaction.editReply({
         content: "▶ Просмотр продолжен.",
-        flags: MessageFlags.Ephemeral,
-      });
+              });
       return;
     }
 
@@ -1255,53 +2872,70 @@ bot.on("interactionCreate", async (interaction) => {
 
       await seekMovie(seconds);
 
-      await interaction.reply({
+      await interaction.editReply({
         content: `⏩ Перемотано на ${formatTime(seconds)}`,
-        flags: MessageFlags.Ephemeral,
-      });
+              });
       return;
     }
 
     if (sub === "skipvote") {
-      const winner = await finishVoting({ extendIfEmpty: false });
+      if (state.phase === "DUB_VOTING") {
+        const dub = await finishDubVoting();
 
-      await interaction.reply({
-        content:
-          `⏭ Голосование завершено. **${winner.title}** выбран. ` +
-          `Предзагрузка ${formatTime(MOVIE_PRELOAD_SECONDS)}, затем общий старт.`,
-        flags: MessageFlags.Ephemeral,
+        await interaction.editReply({
+          content:
+            `🎙 Выбрана озвучка **${dub.title}**. ` +
+            `Предзагрузка ${formatTime(MOVIE_PRELOAD_SECONDS)}, ` +
+            `затем общий старт.`,
+                  });
+        return;
+      }
+
+      const winner = await finishVoting({
+        extendIfEmpty: false,
       });
+
+      if (!winner) {
+        throw new Error(
+          "Не удалось завершить голосование."
+        );
+      }
+
+      await interaction.editReply({
+        content:
+          winner.kind === "ANIME"
+            ? `🍥 **${winner.title}** выбрано. Теперь голосуем за озвучку.`
+            : `⏭ Голосование завершено. **${winner.title}** выбран. ` +
+              `Предзагрузка ${formatTime(MOVIE_PRELOAD_SECONDS)}, затем общий старт.`,
+              });
       return;
     }
 
     if (sub === "skip" || sub === "voting") {
       await startVoting();
 
-      await interaction.reply({
+      await interaction.editReply({
         content: `🗳 Голосование открыто на ${Math.floor(
           VOTING_DURATION_SECONDS / 60
         )} мин.`,
-        flags: MessageFlags.Ephemeral,
-      });
+              });
       return;
     }
 
     if (sub === "stop") {
       await stopSession();
 
-      await interaction.reply({
+      await interaction.editReply({
         content: "⏹ Movie Night остановлен.",
-        flags: MessageFlags.Ephemeral,
-      });
+              });
       return;
     }
 
     if (sub === "status") {
       if (state.phase === "IDLE") {
-        await interaction.reply({
+        await interaction.editReply({
           content: "Movie Night сейчас не запущен.",
-          flags: MessageFlags.Ephemeral,
-        });
+                  });
         return;
       }
 
@@ -1311,13 +2945,31 @@ bot.on("interactionCreate", async (interaction) => {
           Math.ceil((state.voteEndsAt - Date.now()) / 1000)
         );
 
-        await interaction.reply({
+        await interaction.editReply({
           content:
             `🗳 Идёт голосование\n` +
             `Вариантов: **${state.suggestions.length}**\n` +
             `Осталось: **${formatTime(left)}**`,
-          flags: MessageFlags.Ephemeral,
-        });
+                  });
+        return;
+      }
+
+      if (state.phase === "DUB_VOTING") {
+        const left = Math.max(
+          0,
+          Math.ceil(
+            (state.dubVoteEndsAt - Date.now()) / 1000
+          )
+        );
+
+        await interaction.editReply({
+          content:
+            `🎙 Голосуем за озвучку **${
+              state.animeWinner?.title || "аниме"
+            }**\n` +
+            `Озвучек: **${state.dubOptions.length}**\n` +
+            `Осталось: **${formatTime(left)}**`,
+                  });
         return;
       }
 
@@ -1330,36 +2982,35 @@ bot.on("interactionCreate", async (interaction) => {
           Math.ceil((state.autoStartAt - Date.now()) / 1000)
         );
 
-        await interaction.reply({
+        await interaction.editReply({
           content:
             `⏳ **${state.movie?.title || "Фильм"}**\n` +
             `Предзагрузка у зрителей\n` +
             `Общий старт через: **${formatTime(left)}**\n` +
             `Позиция старта: **0:00**`,
-          flags: MessageFlags.Ephemeral,
-        });
+                  });
         return;
       }
 
-      await interaction.reply({
+      await interaction.editReply({
         content:
           `🎬 **${state.movie?.title || "Фильм"}**\n` +
           `${state.phase === "PAUSED" ? "⏸" : "▶"} ` +
           `${formatTime(pos)}` +
           `${duration ? ` / ${formatTime(duration)}` : ""}`,
-        flags: MessageFlags.Ephemeral,
-      });
+              });
     }
   } catch (error) {
     console.error("Command error:", error);
 
     const payload = {
       content: `Ошибка: ${error.message}`,
-      flags: MessageFlags.Ephemeral,
-    };
+          };
 
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp(payload).catch(() => {});
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({
+        content: payload.content,
+      }).catch(() => {});
     } else {
       await interaction.reply(payload).catch(() => {});
     }
@@ -1483,6 +3134,15 @@ setInterval(async () => {
       Date.now() >= state.voteEndsAt
     ) {
       await finishVoting({ extendIfEmpty: true });
+      return;
+    }
+
+    if (
+      state.phase === "DUB_VOTING" &&
+      state.dubVoteEndsAt &&
+      Date.now() >= state.dubVoteEndsAt
+    ) {
+      await finishDubVoting();
       return;
     }
 
