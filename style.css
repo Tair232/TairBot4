@@ -3,6 +3,11 @@
   color: #fff;
   background: #000;
   color-scheme: dark;
+
+  --sait: var(--discord-safe-area-inset-top, env(safe-area-inset-top, 0px));
+  --saib: var(--discord-safe-area-inset-bottom, env(safe-area-inset-bottom, 0px));
+  --sail: var(--discord-safe-area-inset-left, env(safe-area-inset-left, 0px));
+  --sair: var(--discord-safe-area-inset-right, env(safe-area-inset-right, 0px));
 }
 
 * {
@@ -34,6 +39,13 @@ input {
 .movie-black,
 .movie-screen {
   background: #000;
+}
+
+.movie-screen {
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .movie-screen video {
@@ -109,7 +121,11 @@ input {
 
 .preload-overlay {
   position: absolute;
-  inset: 0;
+  inset:
+    var(--sait)
+    var(--sair)
+    var(--saib)
+    var(--sail);
   z-index: 12;
   display: grid;
   place-items: center;
@@ -176,8 +192,8 @@ input {
 
 .volume-hud {
   position: absolute;
-  left: 18px;
-  bottom: 18px;
+  left: calc(14px + var(--sail));
+  bottom: calc(14px + var(--saib));
   z-index: 30;
 
   display: flex;
@@ -207,6 +223,51 @@ input {
   pointer-events: auto;
 }
 
+.time-hud {
+  position: absolute;
+  right: calc(18px + var(--sair));
+  bottom: calc(18px + var(--saib));
+  z-index: 29;
+
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+
+  padding: 10px 13px;
+  border: 1px solid rgba(255, 255, 255, .14);
+  border-radius: 999px;
+
+  color: #fff;
+  background: rgba(8, 10, 15, .72);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 10px 36px rgba(0, 0, 0, .32);
+
+  opacity: 0;
+  transform: translateY(6px);
+  pointer-events: none;
+  user-select: none;
+
+  transition:
+    opacity .16s ease,
+    transform .16s ease;
+}
+
+.time-hud.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.time-hud-label {
+  color: rgba(255, 255, 255, .72);
+  font-size: 12px;
+}
+
+.time-hud strong {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .01em;
+}
+
 .volume-button {
   width: 30px;
   height: 30px;
@@ -229,6 +290,14 @@ input {
   width: 118px;
   accent-color: #fff;
   cursor: pointer;
+}
+
+.volume-value {
+  min-width: 38px;
+  color: #fff;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
 .tap-to-play {
@@ -290,7 +359,11 @@ input {
   width: min(1080px, calc(100% - 32px));
   min-height: 100%;
   margin: 0 auto;
-  padding: 44px 0;
+  padding:
+    calc(44px + var(--sait))
+    var(--sair)
+    calc(44px + var(--saib))
+    var(--sail);
 }
 
 .vote-header {
@@ -471,5 +544,175 @@ input:focus {
 
   .vote-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+
+/* PHONE / TABLET */
+@media (pointer: coarse), (max-width: 760px) {
+  html,
+  body,
+  #app {
+    overscroll-behavior: none;
+  }
+
+  .tap-to-play {
+    padding:
+      var(--sait)
+      var(--sair)
+      var(--saib)
+      var(--sail);
+    font-size: clamp(18px, 5vw, 28px);
+  }
+
+  .preload-card {
+    width: min(92%, 420px);
+    padding: 16px 18px;
+  }
+
+  .late-join-skip {
+    min-width: 180px;
+    min-height: 48px;
+    padding: 11px 20px;
+    font-size: 16px;
+  }
+
+  .volume-hud {
+    left: calc(10px + var(--sail));
+    right: calc(10px + var(--sair));
+    bottom: calc(10px + var(--saib));
+    width: auto;
+    min-height: 52px;
+    gap: 10px;
+    padding: 8px 12px;
+    border-radius: 16px;
+  }
+
+  .volume-button {
+    width: 44px;
+    height: 44px;
+    flex: 0 0 44px;
+    font-size: 20px;
+  }
+
+  .volume-slider {
+    width: auto;
+    min-width: 0;
+    flex: 1 1 auto;
+    height: 34px;
+  }
+
+  .volume-value {
+    flex: 0 0 42px;
+    font-size: 13px;
+  }
+
+  .time-hud {
+    right: calc(10px + var(--sair));
+    bottom: calc(72px + var(--saib));
+    min-height: 40px;
+    padding: 9px 12px;
+    border-radius: 14px;
+  }
+
+  .time-hud-label {
+    font-size: 12px;
+  }
+
+  .time-hud strong {
+    font-size: 14px;
+  }
+
+  .vote-wrap {
+    width: 100%;
+    padding:
+      calc(18px + var(--sait))
+      calc(12px + var(--sair))
+      calc(18px + var(--saib))
+      calc(12px + var(--sail));
+  }
+
+  .vote-header {
+    align-items: flex-start;
+    margin-bottom: 18px;
+  }
+
+  .vote-header h1 {
+    font-size: clamp(30px, 10vw, 48px);
+  }
+
+  .vote-timer {
+    min-width: 72px;
+    font-size: clamp(24px, 8vw, 38px);
+  }
+
+  .vote-grid {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .vote-panel {
+    padding: 16px;
+    border-radius: 16px;
+  }
+
+  input {
+    min-height: 48px;
+    padding: 12px 14px;
+    font-size: 16px;
+  }
+
+  .primary-action {
+    min-height: 48px;
+    font-size: 16px;
+  }
+
+  .suggestion {
+    min-height: 72px;
+    padding: 12px 13px;
+  }
+
+  .vote-count {
+    min-width: 46px;
+    height: 46px;
+  }
+}
+
+/* Very small phones in portrait voting mode */
+@media (max-width: 390px) {
+  .vote-header {
+    gap: 12px;
+  }
+
+  .vote-header h1 {
+    font-size: 31px;
+  }
+
+  .vote-timer {
+    font-size: 25px;
+  }
+
+  .vote-panel {
+    padding: 13px;
+  }
+
+  .suggestion-main strong {
+    font-size: 14px;
+  }
+}
+
+/* Movie is intended for landscape on phones. If orientation lock is unavailable,
+   still keep controls usable in portrait. */
+@media (pointer: coarse) and (orientation: portrait) {
+  .movie-screen video {
+    object-fit: contain;
+  }
+
+  .preload-card {
+    margin:
+      calc(10px + var(--sait))
+      calc(10px + var(--sair))
+      calc(10px + var(--saib))
+      calc(10px + var(--sail));
   }
 }
