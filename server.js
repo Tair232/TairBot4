@@ -290,7 +290,12 @@ function parseKodik(raw) {
     return null;
   }
 
-  if (!/(^|\.)kodik\.(info|cc|biz)$/i.test(url.hostname)) {
+  const hostname = String(url.hostname || "").toLowerCase();
+
+  if (
+    hostname !== "kodik.info" &&
+    hostname !== "kodikplayer.com"
+  ) {
     return null;
   }
 
@@ -298,10 +303,7 @@ function parseKodik(raw) {
     return null;
   }
 
-  // Discord Activity has /kodik mapped to kodik.info.
-  // Normalize other Kodik player hostnames to that mapped host.
   url.protocol = "https:";
-  url.hostname = "kodik.info";
   url.port = "";
 
   if (!url.searchParams.has("hide_selectors")) {
@@ -310,6 +312,7 @@ function parseKodik(raw) {
 
   return {
     url: url.toString(),
+    kodikHost: hostname,
     kodikPath: `${url.pathname}${url.search}${url.hash || ""}`,
   };
 }
@@ -333,15 +336,16 @@ function normalizeKodikPlayerUrl(raw) {
     return null;
   }
 
+  const hostname = String(url.hostname || "").toLowerCase();
+
   if (
-    !/(^|\.)kodik\.(info|cc|biz)$/i.test(url.hostname)
+    hostname !== "kodik.info" &&
+    hostname !== "kodikplayer.com"
   ) {
     return null;
   }
 
-  // Use the domain that is mapped in Discord Developer Portal.
   url.protocol = "https:";
-  url.hostname = "kodik.info";
   url.port = "";
 
   return url.toString();
@@ -1487,7 +1491,7 @@ async function startAnime(title, rawUrl, extra = {}) {
 
   if (!parsed) {
     throw new Error(
-      "Нужна ссылка на официальный Kodik player вида https://kodik.info/..."
+      "Нужна ссылка Kodik player с kodik.info или kodikplayer.com."
     );
   }
 
@@ -1502,6 +1506,7 @@ async function startAnime(title, rawUrl, extra = {}) {
       source: "KODIK",
       title: String(title || "").trim().slice(0, 100),
       url: parsed.url,
+      kodikHost: parsed.kodikHost,
       kodikPath: parsed.kodikPath,
       dubTitle: extra.dubTitle
         ? String(extra.dubTitle).slice(0, 100)
