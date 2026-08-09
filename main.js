@@ -41,6 +41,7 @@ async function setActivityOrientation(mode) {
 
 let socket = null;
 let currentState = null;
+let currentDiscordUserId = null;
 
 let serverClockOffsetMs = 0;
 let serverClockReady = false;
@@ -115,6 +116,9 @@ async function syncServerClock() {
 const player = {
   key: null,
   video: null,
+  iframe: null,
+  kodikBridgeTimer: null,
+  kodikBridgeStartedAt: 0,
   tap: null,
   loader: null,
   loaderText: null,
@@ -126,6 +130,9 @@ const player = {
   loaded: false,
   qualities: [],
   qualityIndex: -1,
+  preferMediaRelay: true,
+  appliedSeekRevision: 0,
+  startupDelayApplied: false,
 
   retryTimer: null,
   syncTimer: null,
@@ -177,7 +184,13 @@ function fmt(seconds) {
 }
 
 function movieKey(movie) {
-  return movie ? `${movie.oid}_${movie.id}_${movie.hash || ""}` : "";
+  if (!movie) return "";
+
+  if (movie.source === "KODIK") {
+    return `kodik:${movie.url || movie.kodikPath || ""}`;
+  }
+
+  return `vk:${movie.oid}_${movie.id}_${movie.hash || ""}`;
 }
 
 function globalPreloadExpired(state) {
@@ -256,6 +269,7 @@ function destroyPlayer() {
   clearTimeout(player.playWatchdog);
   clearTimeout(player.volumeHideTimer);
   clearInterval(player.syncTimer);
+  clearInterval(player.kodikBridgeTimer);
 
   player.retryTimer = null;
   player.playWatchdog = null;
@@ -270,8 +284,17 @@ function destroyPlayer() {
     } catch {}
   }
 
+  if (player.iframe) {
+    try {
+      player.iframe.src = "about:blank";
+    } catch {}
+  }
+
   player.key = null;
   player.video = null;
+  player.iframe = null;
+  player.kodikBridgeTimer = null;
+  player.kodikBridgeStartedAt = 0;
   player.tap = null;
   player.loader = null;
   player.loaderText = null;
@@ -282,6 +305,9 @@ function destroyPlayer() {
   player.loaded = false;
   player.qualities = [];
   player.qualityIndex = -1;
+  player.preferMediaRelay = true;
+  player.appliedSeekRevision = 0;
+  player.startupDelayApplied = false;
   player.firstFrameSeen = false;
   player.buffering = false;
   player.lastProgressLogAt = 0;
@@ -348,13 +374,31 @@ function hideTap() {
 }
 
 function renderMovie(state) {
+  if (state.movie?.source === "KODIK") {
+    renderKodikMovie(state);
+    return;
+  }
+
   const key = movieKey(state.movie);
 
   if (player.video && player.key === key) {
     updatePreloadOverlay(state);
 
-    // Server broadcasts state repeatedly. Never force-seek on every packet.
-    applyHostState(false);
+    const revision = Number(state.seekRevision) || 0;
+    const forceExplicitSeek =
+      player.loaded &&
+      revision !== player.appliedSeekRevision;
+
+    applyHostState(forceExplicitSeek);
+
+    if (forceExplicitSeek) {
+      player.appliedSeekRevision = revision;
+
+      console.log(
+        `[SYNC] explicit seek applied revision=${revision}`
+      );
+    }
+
     return;
   }
 
@@ -594,9 +638,19 @@ function renderMovie(state) {
     if (!isCurrentMovie(key)) return;
 
     const error = player.video.error;
-    console.error("[PLAYER] media error:", error);
 
-    // Signed VK links can fail/expire. Refetch fresh VK metadata.
+    console.error(
+      "[PLAYER] media error:",
+      error,
+      `networkState=${player.video.networkState}`,
+      `readyState=${player.video.readyState}`
+    );
+
+    if (error?.code === 4) {
+      player.preferMediaRelay = true;
+    }
+
+    // Refresh metadata, then direct/relay source selection will run again.
     retryFreshMovieSource(
       `Ошибка потока ${error?.code || "?"}`
     );
@@ -612,9 +666,422 @@ function renderMovie(state) {
   }, 1000);
 }
 
+
+function kodikProxyPath(movie) {
+  const raw = String(movie?.kodikPath || "");
+
+  if (!raw.startsWith("/")) {
+    throw new Error("Kodik path отсутствует.");
+  }
+
+  // /kodik is a Discord Activity URL Mapping -> kodik.info
+  return `/kodik${raw}`;
+}
+
+function findVideoInDocument(doc, depth = 0) {
+  if (!doc || depth > 4) return null;
+
+  const direct = doc.querySelector?.("video");
+
+  if (direct) return direct;
+
+  const frames = Array.from(doc.querySelectorAll?.("iframe") || []);
+
+  for (const frame of frames) {
+    try {
+      const child = frame.contentDocument;
+
+      if (!child) continue;
+
+      const found = findVideoInDocument(child, depth + 1);
+
+      if (found) return found;
+    } catch {
+      // Cross-origin nested frame; keep looking.
+    }
+  }
+
+  return null;
+}
+
+function attachKodikVideo(video, state, key) {
+  if (!video || !isCurrentMovie(key)) return;
+
+  clearInterval(player.kodikBridgeTimer);
+  player.kodikBridgeTimer = null;
+
+  player.video = video;
+  player.loaded = video.readyState >= 1;
+
+  console.log(
+    `[KODIK] inner <video> connected readyState=${video.readyState}`
+  );
+
+  diagnostic("kodik-video-found", {
+    mode: `readyState=${video.readyState}`,
+  });
+
+  try {
+    video.playsInline = true;
+  } catch {}
+
+  setupVolumeControls();
+
+  const publishMetadata = () => {
+    if (!isCurrentMovie(key)) return;
+
+    const duration = Number(video.duration);
+
+    if (Number.isFinite(duration) && duration > 0) {
+      player.loaded = true;
+
+      socket?.emit("movie:metadata", {
+        movieKey: key,
+        duration,
+      });
+
+      updateTimeRemaining();
+      hideLoader();
+      seekToHost(true);
+      applyHostState(true);
+    }
+  };
+
+  video.addEventListener("loadedmetadata", publishMetadata);
+  video.addEventListener("durationchange", publishMetadata);
+
+  video.addEventListener("loadeddata", () => {
+    if (!isCurrentMovie(key)) return;
+
+    player.loaded = true;
+    hideLoader();
+    applyHostState(false);
+  });
+
+  video.addEventListener("canplay", () => {
+    if (!isCurrentMovie(key)) return;
+
+    player.loaded = true;
+    player.buffering = false;
+    hideLoader();
+    applyHostState(false);
+  });
+
+  video.addEventListener("playing", () => {
+    if (!isCurrentMovie(key)) return;
+
+    player.loaded = true;
+    player.firstFrameSeen = true;
+    player.buffering = false;
+    player.playAttemptPending = false;
+
+    clearTimeout(player.playWatchdog);
+    player.playWatchdog = null;
+
+    hideLoader();
+    hideError();
+    hideTap();
+    updatePreloadOverlay(currentState);
+    emitPlaybackProgress();
+  });
+
+  video.addEventListener("waiting", () => {
+    if (!isCurrentMovie(key)) return;
+
+    player.buffering = true;
+    emitPlaybackProgress();
+  });
+
+  video.addEventListener("stalled", () => {
+    if (!isCurrentMovie(key)) return;
+
+    player.buffering = true;
+    emitPlaybackProgress();
+  });
+
+  video.addEventListener("pause", () => {
+    if (!isCurrentMovie(key)) return;
+
+    if (wantsPlayback(currentState) && !video.ended) {
+      setTimeout(() => {
+        if (isCurrentMovie(key)) applyHostState(false);
+      }, 300);
+    }
+  });
+
+  video.addEventListener("ended", () => {
+    if (!isCurrentMovie(key)) return;
+
+    emitPlaybackProgress(true);
+    socket?.emit("movie:ended", {
+      movieKey: key,
+    });
+  });
+
+  video.addEventListener("error", () => {
+    if (!isCurrentMovie(key)) return;
+
+    const error = video.error;
+
+    diagnostic("kodik-video-error", {
+      error: `code=${error?.code || "?"}`,
+      mode:
+        `ready=${video.readyState} network=${video.networkState}`,
+    });
+
+    showError(
+      `Kodik video error ${error?.code || "?"}. ` +
+      `Попробуй переоткрыть Activity.`
+    );
+  });
+
+  if (video.readyState >= 1) {
+    publishMetadata();
+  } else {
+    setLoader("Kodik найден, жду metadata…");
+  }
+
+  player.syncTimer = setInterval(() => {
+    if (!isCurrentMovie(key)) return;
+
+    updatePreloadOverlay(currentState);
+    updateTimeRemaining();
+    applyHostState(false);
+    emitPlaybackProgress();
+  }, 1000);
+}
+
+function beginKodikBridge(state, key) {
+  const iframe = player.iframe;
+
+  if (!iframe) return;
+
+  clearInterval(player.kodikBridgeTimer);
+
+  player.kodikBridgeStartedAt = Date.now();
+
+  const probe = () => {
+    if (!isCurrentMovie(key) || !player.iframe) {
+      clearInterval(player.kodikBridgeTimer);
+      player.kodikBridgeTimer = null;
+      return;
+    }
+
+    try {
+      const doc = iframe.contentDocument;
+
+      if (!doc) return;
+
+      const video = findVideoInDocument(doc);
+
+      if (video) {
+        attachKodikVideo(video, state, key);
+        return;
+      }
+
+      const elapsed = Date.now() - player.kodikBridgeStartedAt;
+
+      if (elapsed > 25_000) {
+        clearInterval(player.kodikBridgeTimer);
+        player.kodikBridgeTimer = null;
+
+        diagnostic("kodik-video-not-found", {
+          error: "No accessible <video> after 25s",
+        });
+
+        showError(
+          "Kodik открылся, но внутренний video недоступен. " +
+          "Скинь логи Bothost — сделаем второй bridge."
+        );
+      }
+    } catch (error) {
+      const elapsed = Date.now() - player.kodikBridgeStartedAt;
+
+      if (elapsed > 8_000) {
+        clearInterval(player.kodikBridgeTimer);
+        player.kodikBridgeTimer = null;
+
+        diagnostic("kodik-cross-origin", {
+          error: error?.message || error,
+        });
+
+        showError(
+          "Discord не дал доступ к внутреннему Kodik video. " +
+          "Нужен другой bridge."
+        );
+      }
+    }
+  };
+
+  player.kodikBridgeTimer = setInterval(probe, 350);
+
+  setTimeout(probe, 50);
+}
+
+function renderKodikMovie(state) {
+  const key = movieKey(state.movie);
+
+  if (player.key === key && player.iframe) {
+    updatePreloadOverlay(state);
+
+    const revision = Number(state.seekRevision) || 0;
+    const forceExplicitSeek =
+      player.loaded &&
+      player.video &&
+      revision !== player.appliedSeekRevision;
+
+    if (player.video) {
+      applyHostState(forceExplicitSeek);
+    }
+
+    if (forceExplicitSeek) {
+      player.appliedSeekRevision = revision;
+
+      diagnostic("kodik-explicit-seek", {
+        mode: `revision=${revision}`,
+      });
+    }
+
+    return;
+  }
+
+  destroyPlayer();
+
+  app.innerHTML = `
+    <main class="screen movie-screen kodik-screen">
+      <iframe
+        id="kodikFrame"
+        class="kodik-frame"
+        title="Kodik Anime Player"
+        allow="autoplay; fullscreen; picture-in-picture"
+        referrerpolicy="no-referrer-when-downgrade"
+      ></iframe>
+
+      <div id="movieLoader" class="movie-loader">
+        <div class="loader-inner">
+          <div class="spinner"></div>
+          <span id="movieLoaderText">Загрузка Kodik…</span>
+        </div>
+      </div>
+
+      <div id="preloadOverlay" class="preload-overlay" hidden>
+        <div class="preload-card">
+          <strong id="preloadTitle">Предзагрузка аниме</strong>
+          <span>
+            <span id="preloadLabel">Общий старт через</span>
+            <b id="preloadTimerText">1:00</b>
+          </span>
+
+          <button
+            id="lateJoinSkipButton"
+            class="late-join-skip"
+            type="button"
+            hidden
+          >
+            Смотреть сейчас
+          </button>
+        </div>
+      </div>
+
+      <div id="volumeHud" class="volume-hud">
+        <button
+          id="volumeButton"
+          class="volume-button"
+          type="button"
+          aria-label="Звук"
+        >
+          🔊
+        </button>
+
+        <input
+          id="volumeSlider"
+          class="volume-slider"
+          type="range"
+          min="0"
+          max="100"
+          step="1"
+          value="100"
+          aria-label="Громкость"
+        />
+
+        <span id="volumeValue" class="volume-value">100%</span>
+      </div>
+
+      <div
+        id="timeHud"
+        class="time-hud"
+        aria-live="off"
+        aria-label="Оставшееся время аниме"
+      >
+        <span class="time-hud-label">Осталось</span>
+        <strong id="timeRemainingText">--:--</strong>
+      </div>
+
+      <button id="tapToPlay" class="tap-to-play" hidden>
+        ▶ Нажмите, чтобы начать просмотр
+      </button>
+
+      <div id="movieError" class="movie-error" hidden>
+        <strong>Не удалось подключить Kodik</strong>
+        <span id="movieErrorText">Проверяю плеер…</span>
+      </div>
+    </main>
+  `;
+
+  player.key = key;
+  player.iframe = document.querySelector("#kodikFrame");
+  player.tap = document.querySelector("#tapToPlay");
+  player.loader = document.querySelector("#movieLoader");
+  player.loaderText = document.querySelector("#movieLoaderText");
+  player.errorBox = document.querySelector("#movieError");
+  player.errorText = document.querySelector("#movieErrorText");
+
+  player.preloadOverlay = document.querySelector("#preloadOverlay");
+  player.preloadTitle = document.querySelector("#preloadTitle");
+  player.preloadLabel = document.querySelector("#preloadLabel");
+  player.preloadTimerText = document.querySelector("#preloadTimerText");
+  player.lateJoinSkipButton = document.querySelector("#lateJoinSkipButton");
+
+  player.volumeHud = document.querySelector("#volumeHud");
+  player.volumeButton = document.querySelector("#volumeButton");
+  player.volumeSlider = document.querySelector("#volumeSlider");
+  player.volumeValue = document.querySelector("#volumeValue");
+
+  player.timeHud = document.querySelector("#timeHud");
+  player.timeRemainingText = document.querySelector("#timeRemainingText");
+
+  configureLateJoinIfNeeded(state, key);
+
+  if (player.lateJoinSkipButton) {
+    player.lateJoinSkipButton.onclick = skipLateJoinWait;
+  }
+
+  player.tap.onclick = handleUserPlayGesture;
+
+  updatePreloadOverlay(state);
+
+  const src = kodikProxyPath(state.movie);
+
+  diagnostic("kodik-iframe-load", {
+    mode: src.slice(0, 120),
+  });
+
+  player.iframe.addEventListener("load", () => {
+    if (!isCurrentMovie(key)) return;
+
+    diagnostic("kodik-iframe-loaded");
+    beginKodikBridge(state, key);
+  });
+
+  player.iframe.src = src;
+
+  // Some clients may not fire load in the way we expect after the proxy.
+  // Start probing anyway.
+  beginKodikBridge(state, key);
+}
+
 function isCurrentMovie(key) {
   return Boolean(
-    player.video &&
     player.key === key &&
     currentState?.movie &&
     movieKey(currentState.movie) === key
@@ -648,6 +1115,9 @@ function configureLateJoinIfNeeded(state, key) {
   player.lateJoinActive = true;
   player.lateJoinStarted = false;
   player.lateJoinTargetPosition = target;
+
+  // V9.15 uses fresh server-side VK metadata + Bothost relay for everyone.
+  player.preferMediaRelay = true;
 
   // Convert target movie position to authoritative server wall-clock time.
   const base = Math.max(0, Number(state.positionSeconds) || 0);
@@ -971,9 +1441,10 @@ function qualityNumber(key) {
 }
 
 function qualityOrder(files) {
-  // This mirrors the old working player: prefer 1080, then 720.
-  // Higher-than-1080 streams are intentionally not preferred for Discord.
-  const order = [1080, 720, 480, 360, 240, 144, 1440, 2160];
+  // 720p is the reliability-first default for a group Activity.
+  // It greatly reduces the simultaneous startup burst compared with 1080p.
+  // 1080p remains the second choice.
+  const order = [720, 1080, 480, 360, 240, 144, 1440, 2160];
   const result = [];
 
   for (const q of order) {
@@ -1009,6 +1480,93 @@ function mappedMediaUrl(original) {
   }
 
   throw new Error(`Неподдерживаемый VK CDN: ${url.hostname}`);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function stableViewerHash(value) {
+  let hash = 2166136261;
+
+  for (const char of String(value || "")) {
+    hash ^= char.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return hash >>> 0;
+}
+
+function initialMediaDelayMs(key) {
+  // Spread viewers across ~0..9 seconds. The room already has a 60-second
+  // preload window, so this reduces the thundering-herd without delaying
+  // the synchronized movie start.
+  const seed = `${currentDiscordUserId || "anon"}:${key}:${discordSdk.instanceId || ""}`;
+  const slot = stableViewerHash(seed) % 12;
+
+  return slot * 800;
+}
+
+function diagnostic(stage, extra = {}) {
+  const payload = {
+    stage: String(stage || "").slice(0, 80),
+    movieKey: player.key || null,
+    quality: Number(extra.quality) || null,
+    mode: extra.mode ? String(extra.mode).slice(0, 32) : null,
+    error: extra.error ? String(extra.error).slice(0, 180) : null,
+    readyState: player.video?.readyState ?? null,
+    networkState: player.video?.networkState ?? null,
+  };
+
+  console.log("[PLAYER DIAG]", payload);
+
+  if (socket?.connected) {
+    socket.emit("player:diagnostic", payload);
+  }
+}
+
+function backendMediaUrl(original) {
+  return `/api/media?url=${encodeURIComponent(original)}`;
+}
+
+async function fetchBackendVkQualities(movie) {
+  const params = new URLSearchParams({
+    oid: movie.oid,
+    id: movie.id,
+  });
+
+  if (movie.hash) {
+    params.set("hash", movie.hash);
+  }
+
+  // Unique request to our own backend; VK itself is fetched server-side
+  // with no-store, so Discord's Activity proxy cannot hand us stale embed HTML.
+  params.set("_request", `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+
+  const response = await fetch(`/api/vk-meta?${params}`, {
+    cache: "no-store",
+    credentials: "omit",
+    headers: {
+      "Cache-Control": "no-cache",
+      "Pragma": "no-cache",
+    },
+  });
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(
+      data?.error || `Backend VK metadata HTTP ${response.status}`
+    );
+  }
+
+  const qualities = qualityOrder(data?.files || {});
+
+  if (!qualities.length) {
+    throw new Error("Backend VK не отдал MP4");
+  }
+
+  return qualities;
 }
 
 function waitForMetadata(video, timeoutMs, generation) {
@@ -1064,95 +1622,226 @@ async function loadFreshMovieSource(movie, key) {
   player.loading = true;
   player.loaded = false;
   player.firstFrameSeen = false;
+  player.preferMediaRelay = true;
 
   const generation = ++player.loadGeneration;
 
   clearTimeout(player.retryTimer);
   player.retryTimer = null;
 
-  setLoader("Получаю видео VK…");
+  setLoader("Подготовка видео…");
 
   try {
-    const response = await fetch(vkEmbedPath(movie), {
-      cache: "no-store",
-      credentials: "omit",
+    // Spread first requests across the existing preload window so that a
+    // group of viewers does not hit Bothost/VK in the same millisecond.
+    if (!player.startupDelayApplied) {
+      player.startupDelayApplied = true;
+
+      const delayMs = player.lateJoinActive
+        ? 0
+        : initialMediaDelayMs(key);
+
+      if (delayMs > 0) {
+        diagnostic("startup-stagger", {
+          mode: `${delayMs}ms`,
+        });
+
+        setLoader(
+          `Подготовка источника… ${Math.ceil(delayMs / 1000)} сек`
+        );
+
+        await sleep(delayMs);
+
+        if (
+          generation !== player.loadGeneration ||
+          !isCurrentMovie(key)
+        ) {
+          return;
+        }
+      }
+    }
+
+    diagnostic("vk-metadata-backend-start");
+
+    // V9.15: ALL viewers obtain fresh VK metadata through Bothost.
+    // Discord Activity no longer fetches video_ext.php directly.
+    const qualities = await fetchBackendVkQualities(movie);
+
+    diagnostic("vk-metadata-backend-ok", {
+      mode: `${qualities.length} qualities`,
     });
 
-    if (generation !== player.loadGeneration || !isCurrentMovie(key)) return;
-
-    const html = await response.text();
-
-    if (!response.ok) {
-      throw new Error(`VK HTTP ${response.status}`);
+    if (
+      generation !== player.loadGeneration ||
+      !isCurrentMovie(key)
+    ) {
+      return;
     }
 
-    const files = extractMp4Files(html);
-    player.qualities = qualityOrder(files);
-
-    if (!player.qualities.length) {
-      throw new Error("VK не отдал MP4");
-    }
+    player.qualities = qualities;
 
     let lastError = null;
 
-    for (let i = 0; i < player.qualities.length; i++) {
-      if (generation !== player.loadGeneration || !isCurrentMovie(key)) return;
+    for (let i = 0; i < qualities.length; i++) {
+      const quality = qualities[i];
+      const q = qualityNumber(quality.key);
 
-      const quality = player.qualities[i];
-
-      try {
-        setLoader(`Загрузка ${qualityNumber(quality.key)}p…`);
-
-        const video = player.video;
-
+      // Two relay attempts for the same quality before dropping down.
+      // The second attempt asks /api/vk-meta again, which gives a fresh
+      // signed CDN URL instead of reusing the first one.
+      for (let attempt = 1; attempt <= 2; attempt++) {
         try {
-          video.pause();
-          video.removeAttribute("src");
+          if (
+            generation !== player.loadGeneration ||
+            !isCurrentMovie(key)
+          ) {
+            return;
+          }
+
+          if (attempt > 1) {
+            const retryDelay =
+              900 +
+              (stableViewerHash(
+                `${currentDiscordUserId}:${key}:${q}:${generation}:relay`
+              ) % 1800);
+
+            diagnostic("relay-retry-wait", {
+              quality: q,
+              mode: `${retryDelay}ms`,
+            });
+
+            setLoader(
+              `Повтор ${q}p через ${Math.ceil(retryDelay / 1000)} сек…`
+            );
+
+            await sleep(retryDelay);
+
+            if (
+              generation !== player.loadGeneration ||
+              !isCurrentMovie(key)
+            ) {
+              return;
+            }
+          }
+
+          // First attempt uses the fresh list we already fetched.
+          // Retry refreshes video_ext again to obtain another signed URL.
+          let freshQualities = qualities;
+
+          if (attempt > 1) {
+            diagnostic("vk-metadata-backend-refresh", {
+              quality: q,
+            });
+
+            freshQualities = await fetchBackendVkQualities(movie);
+          }
+
+          const freshQuality =
+            freshQualities.find((item) => item.key === quality.key) ||
+            freshQualities[i] ||
+            freshQualities[0];
+
+          if (!freshQuality?.url) {
+            throw new Error("Свежий backend MP4 не найден");
+          }
+
+          const video = player.video;
+
+          try {
+            video.pause();
+            video.removeAttribute("src");
+            video.load();
+          } catch {}
+
+          const source = backendMediaUrl(freshQuality.url);
+
+          setLoader(
+            attempt === 1
+              ? `Загрузка ${q}p…`
+              : `Повторная загрузка ${q}p…`
+          );
+
+          diagnostic("media-relay-start", {
+            quality: q,
+            mode: `relay-attempt-${attempt}`,
+          });
+
+          const metadataStartedAt = performance.now();
+
+          const metadataPromise = waitForMetadata(
+            video,
+            35_000,
+            generation
+          );
+
+          video.src = source;
           video.load();
-        } catch {}
 
-        const metadataPromise = waitForMetadata(video, 18_000, generation);
+          await metadataPromise;
 
-        video.src = mappedMediaUrl(quality.url);
-        video.load();
+          if (
+            generation !== player.loadGeneration ||
+            !isCurrentMovie(key)
+          ) {
+            return;
+          }
 
-        await metadataPromise;
+          diagnostic("media-metadata-ok", {
+            quality: q,
+            mode:
+              `relay-attempt-${attempt} ` +
+              `${Math.round(performance.now() - metadataStartedAt)}ms`,
+          });
 
-        if (generation !== player.loadGeneration || !isCurrentMovie(key)) return;
+          player.qualityIndex = i;
+          player.loaded = true;
+          player.loading = false;
+          player.preferMediaRelay = true;
+          player.appliedSeekRevision =
+            Number(currentState?.seekRevision) || 0;
 
-        player.qualityIndex = i;
-        player.loaded = true;
-        player.loading = false;
+          hideLoader();
 
-        console.log(
-          `[PLAYER] selected ${qualityNumber(quality.key)}p, readyState=${video.readyState}`
-        );
+          seekToHost(true);
+          applyHostState(true);
+          return;
+        } catch (error) {
+          lastError = error;
 
-        // Critical difference from V8.x:
-        // success means "source loaded". We do NOT await play() here.
-        hideLoader();
-        seekToHost(true);
-        applyHostState(true);
-        return;
-      } catch (error) {
-        lastError = error;
-        console.warn(
-          `[PLAYER] ${qualityNumber(quality.key)}p failed:`,
-          error?.message || error
-        );
+          diagnostic("media-relay-failed", {
+            quality: q,
+            mode: `relay-attempt-${attempt}`,
+            error: error?.message || error,
+          });
+        }
       }
     }
 
     throw lastError || new Error("Все качества VK недоступны");
   } catch (error) {
-    if (generation !== player.loadGeneration || !isCurrentMovie(key)) return;
+    if (
+      generation !== player.loadGeneration ||
+      !isCurrentMovie(key)
+    ) {
+      return;
+    }
 
     player.loading = false;
     player.loaded = false;
 
-    console.error("[PLAYER] load failed:", error);
+    diagnostic("movie-load-failed", {
+      error: error?.message || error,
+    });
 
-    showError(`${error?.message || error}. Новая попытка через 4 сек…`);
+    showError(
+      `${error?.message || error}. Новая попытка через несколько секунд…`
+    );
+
+    const retryDelay =
+      5000 +
+      (stableViewerHash(
+        `${currentDiscordUserId}:${key}:${generation}:full-relay-retry`
+      ) % 3000);
 
     player.retryTimer = setTimeout(() => {
       player.retryTimer = null;
@@ -1161,9 +1850,10 @@ async function loadFreshMovieSource(movie, key) {
 
       hideError();
       loadFreshMovieSource(currentState.movie, key);
-    }, 4000);
+    }, retryDelay);
   }
 }
+
 
 function retryFreshMovieSource(reason) {
   if (!player.key || !currentState?.movie) return;
@@ -1177,8 +1867,17 @@ function retryFreshMovieSource(reason) {
 
   player.loaded = false;
   player.qualityIndex = -1;
+  player.preferMediaRelay = true;
 
-  showError(`${reason}. Обновляю ссылку VK…`);
+  // Drop the failed signed media URL completely before obtaining a new one.
+  // This is especially important for viewers joining an already-running film.
+  try {
+    player.video?.pause();
+    player.video?.removeAttribute("src");
+    player.video?.load();
+  } catch {}
+
+  showError(`${reason}. Получаю новую ссылку VK…`);
 
   player.retryTimer = setTimeout(() => {
     player.retryTimer = null;
@@ -1636,43 +2335,100 @@ function renderVoting(state) {
           </div>
         </header>
 
+        ${
+          state.notice
+            ? `
+              <div class="vote-notice">
+                ${esc(state.notice)}
+              </div>
+            `
+            : ""
+        }
+
         <div class="vote-grid">
           <section class="vote-panel">
-            <h2>Предложить фильм</h2>
+            <h2>Предложить</h2>
 
             ${
               canSuggest
                 ? `
                   <form id="proposalForm">
-                    <label>
-                      Название
-                      <input
-                        id="proposalTitle"
-                        maxlength="100"
-                        required
-                        placeholder="Название фильма"
-                      />
-                    </label>
+                    <div class="proposal-section">
+                      <div class="proposal-section-title">
+                        🎬 Фильм
+                      </div>
 
-                    <label>
-                      Ссылка VK Видео
-                      <input
-                        id="proposalUrl"
-                        required
-                        placeholder="https://vkvideo.ru/video-..."
-                      />
-                    </label>
+                      <label>
+                        Название
+                        <input
+                          id="proposalTitle"
+                          maxlength="100"
+                          placeholder="Название фильма"
+                        />
+                      </label>
 
-                    <button class="primary-action" type="submit">
-                      Предложить
-                    </button>
+                      <label>
+                        Ссылка VK Видео
+                        <input
+                          id="proposalUrl"
+                          placeholder="https://vkvideo.ru/video-..."
+                        />
+                      </label>
 
-                    <div id="proposalError" class="form-error"></div>
+                      <button
+                        class="primary-action"
+                        type="submit"
+                      >
+                        Предложить фильм
+                      </button>
+                    </div>
+
+                    <div class="proposal-divider">
+                      <span>ИЛИ</span>
+                    </div>
+
+                    <div class="proposal-section anime-proposal-section">
+                      <div class="proposal-section-title">
+                        🍥 Аниме
+                      </div>
+
+                      <label>
+                        Название аниме
+                        <input
+                          id="animeSearchInput"
+                          maxlength="120"
+                          placeholder="Например: Киберпанк или Naruto"
+                        />
+                      </label>
+
+                      <button
+                        id="animeSearchButton"
+                        class="secondary-action"
+                        type="button"
+                      >
+                        Найти аниме
+                      </button>
+
+                      <div
+                        id="animeSearchStatus"
+                        class="anime-search-status"
+                      ></div>
+
+                      <div
+                        id="animeSearchResults"
+                        class="anime-search-results"
+                      ></div>
+                    </div>
+
+                    <div
+                      id="proposalError"
+                      class="form-error"
+                    ></div>
                   </form>
                 `
                 : `
                   <div class="already-proposed">
-                    ✓ Ты уже предложил фильм
+                    ✓ Ты уже предложил вариант
                   </div>
                 `
             }
@@ -1685,18 +2441,42 @@ function renderVoting(state) {
               ${
                 suggestions.length
                   ? suggestions
-                      .map(
-                        (item) => `
+                      .map((item) => {
+                        const isAnime =
+                          item.kind === "ANIME";
+
+                        const meta = isAnime
+                          ? [
+                              "🍥 Аниме",
+                              item.year || null,
+                              item.episodesCount
+                                ? `${item.episodesCount} эп.`
+                                : null,
+                            ]
+                              .filter(Boolean)
+                              .join(" · ")
+                          : "🎬 Фильм";
+
+                        return `
                           <button
                             class="suggestion ${
-                              state.myVote === item.id ? "selected" : ""
+                              state.myVote === item.id
+                                ? "selected"
+                                : ""
                             }"
                             data-vote-id="${esc(item.id)}"
                           >
                             <div class="suggestion-main">
+                              <div class="suggestion-type">
+                                ${esc(meta)}
+                              </div>
+
                               <strong>${esc(item.title)}</strong>
+
                               <span>
-                                Предложил: ${esc(item.proposerName || "Участник")}
+                                Предложил: ${esc(
+                                  item.proposerName || "Участник"
+                                )}
                               </span>
                             </div>
 
@@ -1704,8 +2484,8 @@ function renderVoting(state) {
                               ${Number(item.votes) || 0}
                             </div>
                           </button>
-                        `
-                      )
+                        `;
+                      })
                       .join("")
                   : `
                     <div class="no-suggestions">
@@ -1738,6 +2518,9 @@ function renderVoting(state) {
   const form = document.querySelector("#proposalForm");
 
   if (form) {
+    const proposalError =
+      document.querySelector("#proposalError");
+
     form.onsubmit = (event) => {
       event.preventDefault();
 
@@ -1747,23 +2530,172 @@ function renderVoting(state) {
       const url =
         document.querySelector("#proposalUrl").value.trim();
 
-      const errorBox =
-        document.querySelector("#proposalError");
+      proposalError.textContent = "";
 
-      errorBox.textContent = "";
+      if (!title || !url) {
+        proposalError.textContent =
+          "Для фильма укажи название и ссылку VK Видео.";
+        return;
+      }
 
       socket.emit(
         "vote:suggest",
         { title, url },
         (result) => {
           if (!result?.ok) {
-            errorBox.textContent =
+            proposalError.textContent =
               result?.error ||
               "Не удалось предложить фильм.";
           }
         }
       );
     };
+
+    const animeInput =
+      document.querySelector("#animeSearchInput");
+
+    const animeButton =
+      document.querySelector("#animeSearchButton");
+
+    const animeStatus =
+      document.querySelector("#animeSearchStatus");
+
+    const animeResults =
+      document.querySelector("#animeSearchResults");
+
+    const runAnimeSearch = () => {
+      const query = animeInput.value.trim();
+
+      proposalError.textContent = "";
+      animeResults.innerHTML = "";
+
+      if (query.length < 2) {
+        animeStatus.textContent =
+          "Введи хотя бы 2 символа.";
+        return;
+      }
+
+      animeButton.disabled = true;
+      animeStatus.textContent = "Ищу в Kodik…";
+
+      socket.emit(
+        "anime:search",
+        { query },
+        (result) => {
+          animeButton.disabled = false;
+
+          if (!result?.ok) {
+            animeStatus.textContent =
+              result?.error ||
+              "Не удалось найти аниме.";
+            return;
+          }
+
+          const results = Array.isArray(result.results)
+            ? result.results
+            : [];
+
+          if (!results.length) {
+            animeStatus.textContent =
+              "Ничего похожего не найдено.";
+            return;
+          }
+
+          animeStatus.textContent =
+            `Найдено: ${results.length}. Выбери нужное.`;
+
+          animeResults.innerHTML = results
+            .map((item) => {
+              const details = [
+                item.year || null,
+                item.type === "anime-serial"
+                  ? item.episodesCount
+                    ? `${item.episodesCount} эп.`
+                    : "сериал"
+                  : "фильм",
+                Number(item.translationsCount) > 0
+                  ? `${item.translationsCount} озвуч.`
+                  : null,
+              ]
+                .filter(Boolean)
+                .join(" · ");
+
+              const orig =
+                item.titleOrig &&
+                item.titleOrig !== item.title
+                  ? `<span>${esc(item.titleOrig)}</span>`
+                  : "";
+
+              return `
+                <button
+                  type="button"
+                  class="anime-search-result"
+                  data-anime-result="${esc(item.key)}"
+                >
+                  <div class="anime-result-main">
+                    <strong>${esc(item.title)}</strong>
+                    ${orig}
+                    <small>${esc(details)}</small>
+                  </div>
+
+                  <div class="anime-result-add">
+                    Предложить
+                  </div>
+                </button>
+              `;
+            })
+            .join("");
+
+          animeResults
+            .querySelectorAll("[data-anime-result]")
+            .forEach((button) => {
+              button.onclick = () => {
+                proposalError.textContent = "";
+                animeStatus.textContent =
+                  "Добавляю в голосование…";
+
+                animeResults
+                  .querySelectorAll("button")
+                  .forEach((node) => {
+                    node.disabled = true;
+                  });
+
+                socket.emit(
+                  "vote:suggest-anime",
+                  {
+                    searchId: result.searchId,
+                    resultKey:
+                      button.dataset.animeResult,
+                  },
+                  (proposalResult) => {
+                    if (!proposalResult?.ok) {
+                      animeStatus.textContent = "";
+                      proposalError.textContent =
+                        proposalResult?.error ||
+                        "Не удалось предложить аниме.";
+
+                      animeResults
+                        .querySelectorAll("button")
+                        .forEach((node) => {
+                          node.disabled = false;
+                        });
+                    }
+                  }
+                );
+              };
+            });
+        }
+      );
+    };
+
+    animeButton.onclick = runAnimeSearch;
+
+    animeInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        runAnimeSearch();
+      }
+    });
   }
 
   document
@@ -1790,6 +2722,236 @@ function renderVoting(state) {
     });
 }
 
+function remainingDubVotingSeconds(state) {
+  return Math.max(
+    0,
+    Math.ceil(
+      (Number(state.dubVoteEndsAt) - serverNowMs()) /
+        1000
+    )
+  );
+}
+
+function renderDubVoting(state) {
+  destroyPlayer();
+
+  const options = Array.isArray(state.dubOptions)
+    ? state.dubOptions
+    : [];
+
+  const anime = state.animeWinner || {};
+  const searching = Boolean(state.dubSearching);
+
+  app.innerHTML = `
+    <main class="screen voting-screen">
+      <section class="vote-wrap dub-vote-wrap">
+        <header class="vote-header">
+          <div>
+            <div class="vote-kicker">
+              🍥 АНИМЕ ВЫБРАНО
+            </div>
+
+            <h1>Выбираем озвучку</h1>
+
+            <div class="dub-anime-title">
+              ${esc(anime.title || "Аниме")}
+              ${
+                anime.year
+                  ? `<span>${esc(anime.year)}</span>`
+                  : ""
+              }
+            </div>
+          </div>
+
+          <div class="vote-timer" id="dubVoteTimer">
+            ${
+              searching || !state.dubVoteEndsAt
+                ? "—"
+                : fmt(remainingDubVotingSeconds(state))
+            }
+          </div>
+        </header>
+
+        ${
+          state.notice
+            ? `
+              <div class="vote-notice">
+                ${esc(state.notice)}
+              </div>
+            `
+            : ""
+        }
+
+        <section class="vote-panel dub-vote-panel auto-dub-panel">
+          ${
+            searching
+              ? `
+                <div class="auto-dub-loading">
+                  <div class="spinner"></div>
+                  <strong>Ищу озвучки автоматически…</strong>
+                  <span>AnimeGo → Kodik</span>
+                </div>
+              `
+              : options.length
+                ? `
+                  <div class="dub-explanation">
+                    Нашёл <strong>${options.length}</strong>
+                    ${
+                      options.length === 1
+                        ? "вариант"
+                        : "вариантов"
+                    }.
+                    Голосуй — победитель запустится автоматически.
+                  </div>
+
+                  <div class="suggestions dub-suggestions">
+                    ${options
+                      .map(
+                        (item) => `
+                          <button
+                            class="suggestion ${
+                              state.myDubVote === item.id
+                                ? "selected"
+                                : ""
+                            }"
+                            data-dub-vote-id="${esc(item.id)}"
+                          >
+                            <div class="suggestion-main">
+                              <div class="suggestion-type">
+                                🎙 Озвучка · ${esc(
+                                  item.provider || "Kodik"
+                                )}
+                              </div>
+
+                              <strong>${esc(item.title)}</strong>
+
+                              <span>
+                                ${
+                                  Number(item.episode) === 1
+                                    ? "Плеер найден по 1 серии"
+                                    : `Плеер найден по серии ${esc(
+                                        item.episode
+                                      )}`
+                                }
+                              </span>
+                            </div>
+
+                            <div class="vote-count">
+                              ${Number(item.votes) || 0}
+                            </div>
+                          </button>
+                        `
+                      )
+                      .join("")}
+                  </div>
+
+                  <div id="dubVoteError" class="form-error"></div>
+                `
+                : `
+                  <div class="auto-dub-empty">
+                    <strong>Озвучки не найдены</strong>
+                    <span>
+                      Можно повторить поиск — вручную Kodik-ссылку
+                      больше вводить не нужно.
+                    </span>
+
+                    <button
+                      id="refreshDubsButton"
+                      class="primary-action"
+                      type="button"
+                    >
+                      Повторить поиск
+                    </button>
+
+                    <div
+                      id="dubRefreshError"
+                      class="form-error"
+                    ></div>
+                  </div>
+                `
+          }
+        </section>
+      </section>
+    </main>
+  `;
+
+  const timer = document.querySelector("#dubVoteTimer");
+
+  const timerInterval = setInterval(() => {
+    if (!document.body.contains(timer)) {
+      clearInterval(timerInterval);
+      return;
+    }
+
+    const stateNow = currentState || state;
+
+    timer.textContent =
+      stateNow.dubSearching || !stateNow.dubVoteEndsAt
+        ? "—"
+        : fmt(remainingDubVotingSeconds(stateNow));
+  }, 500);
+
+  document
+    .querySelectorAll("[data-dub-vote-id]")
+    .forEach((button) => {
+      button.onclick = () => {
+        const errorBox =
+          document.querySelector("#dubVoteError");
+
+        if (errorBox) errorBox.textContent = "";
+
+        socket.emit(
+          "vote:dub-cast",
+          {
+            optionId: button.dataset.dubVoteId,
+          },
+          (result) => {
+            if (!result?.ok && errorBox) {
+              errorBox.textContent =
+                result?.error ||
+                "Не удалось проголосовать за озвучку.";
+            }
+          }
+        );
+      };
+    });
+
+  const refreshButton =
+    document.querySelector("#refreshDubsButton");
+
+  if (refreshButton) {
+    refreshButton.onclick = () => {
+      const errorBox =
+        document.querySelector("#dubRefreshError");
+
+      if (errorBox) errorBox.textContent = "";
+
+      refreshButton.disabled = true;
+      refreshButton.textContent = "Ищу…";
+
+      socket.emit(
+        "anime:refresh-dubs",
+        {},
+        (result) => {
+          if (!result?.ok) {
+            refreshButton.disabled = false;
+            refreshButton.textContent =
+              "Повторить поиск";
+
+            if (errorBox) {
+              errorBox.textContent =
+                result?.error ||
+                "Не удалось повторить поиск.";
+            }
+          }
+        }
+      );
+    };
+  }
+}
+
+
+
 /* ---------------- STATE / DISCORD ---------------- */
 
 function renderState(state) {
@@ -1804,6 +2966,12 @@ function renderState(state) {
   if (state.phase === "VOTING") {
     setActivityOrientation("ui");
     renderVoting(state);
+    return;
+  }
+
+  if (state.phase === "DUB_VOTING") {
+    setActivityOrientation("ui");
+    renderDubVoting(state);
     return;
   }
 
@@ -1853,6 +3021,8 @@ async function authenticateDiscord() {
   if (!auth?.user?.id) {
     throw new Error("Discord authenticate не вернул пользователя.");
   }
+
+  currentDiscordUserId = String(auth.user.id);
 
   return json.access_token;
 }
