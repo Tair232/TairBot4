@@ -1,7 +1,7 @@
 {
-  "name": "movie-night-v9-bothost-flat",
+  "name": "movie-night-v9-10-time-remaining",
   "private": true,
-  "version": "2.0.7",
+  "version": "2.0.10",
   "type": "module",
   "scripts": {
     "build": "vite build",
