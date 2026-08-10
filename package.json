@@ -1,7 +1,7 @@
 {
-  "name": "movie-night-v9-30-real-op-ed-volume-fix",
+  "name": "movie-night-v9-32-exact-animego-id-fix",
   "private": true,
-  "version": "2.0.30",
+  "version": "2.0.32",
   "type": "module",
   "scripts": {
     "build": "vite build",
