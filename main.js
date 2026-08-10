@@ -3,21 +3,42 @@ import { io } from "socket.io-client";
 import Hls from "hls.js";
 import "./style.css";
 
-const CLIENT_BUILD = "9.30";
+const CLIENT_BUILD = "9.33";
 
 const CLIENT_ID = "1535948196663009321";
 const ALLOWED_GUILD_ID = "1492151172570808390";
 
 const app = document.querySelector("#app");
-const discordSdk = new DiscordSDK(CLIENT_ID);
+
+const IS_BROWSER_MODE =
+  window.location.pathname === "/watch" ||
+  window.location.pathname.startsWith("/watch/");
+
+const discordSdk =
+  IS_BROWSER_MODE
+    ? null
+    : new DiscordSDK(CLIENT_ID);
 
 const isLikelyTouchDevice =
   matchMedia("(pointer: coarse)").matches ||
   navigator.maxTouchPoints > 0;
 
+const isPhoneLike =
+  /Android|iPhone|iPad|iPod|Mobile/i.test(
+    navigator.userAgent
+  ) ||
+  (
+    matchMedia("(pointer: coarse)").matches &&
+    Math.min(window.innerWidth, window.innerHeight) < 900
+  );
+
+let browserDelegated = false;
+let browserPresenceActive = false;
+
 let lastOrientationMode = null;
 
 async function setActivityOrientation(mode) {
+  if (IS_BROWSER_MODE || !discordSdk) return;
   if (lastOrientationMode === mode) return;
   lastOrientationMode = mode;
 
@@ -172,6 +193,10 @@ const player = {
   volumeHideTimer: null,
   controlsVisible: false,
   animeSkipHud: null,
+  browserHud: null,
+  browserButton: null,
+  fullscreenHud: null,
+  fullscreenButton: null,
 
   timeHud: null,
   timeRemainingText: null,
@@ -270,6 +295,265 @@ function renderFatal(title, detail = "") {
   `;
 }
 
+
+function renderBrowserDelegated() {
+  destroyPlayer();
+
+  app.innerHTML = `
+    <main class="screen browser-delegated-screen">
+      <div class="browser-delegated-card">
+        <div class="browser-delegated-icon">↗</div>
+        <strong>Открыто в браузере</strong>
+        <span>
+          Просмотр и весь интерфейс Movie Night сейчас работают
+          в браузерном окне.
+        </span>
+        <small>
+          Звук и видео внутри Discord Activity отключены.
+        </small>
+      </div>
+    </main>
+  `;
+}
+
+function markActivityPlaybackDelegated() {
+  if (IS_BROWSER_MODE || !socket?.connected) return;
+
+  if (player.video && currentState?.movie) {
+    socket.emit("playback:progress", {
+      movieKey: movieKey(currentState.movie),
+      currentTime: Number(player.video.currentTime) || 0,
+      duration: Number.isFinite(player.video.duration)
+        ? player.video.duration
+        : currentState.movie.duration || null,
+      ended: false,
+      buffering: false,
+      loaded: Boolean(player.loaded),
+      participating: false,
+      lateJoin: false,
+    });
+  }
+
+  socket.emit("browser:delegated");
+}
+
+async function requestBrowserLaunch() {
+  if (
+    IS_BROWSER_MODE ||
+    isPhoneLike ||
+    !discordSdk ||
+    !socket?.connected
+  ) {
+    return;
+  }
+
+  const button = player.browserButton;
+
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Открываю…";
+  }
+
+  try {
+    const result = await new Promise((resolve, reject) => {
+      socket.timeout(7000).emit(
+        "browser:create-ticket",
+        {},
+        (error, reply) => {
+          if (error) {
+            reject(new Error("Backend не ответил."));
+            return;
+          }
+
+          if (!reply?.ok || !reply?.url) {
+            reject(
+              new Error(
+                reply?.error ||
+                "Не удалось создать браузерную сессию."
+              )
+            );
+            return;
+          }
+
+          resolve(reply);
+        }
+      );
+    });
+
+    await discordSdk.commands.openExternalLink({
+      url: result.url,
+    });
+
+    // Immediately silence and stop the Activity copy. The browser becomes
+    // this user's only participating player.
+    if (player.video) {
+      try {
+        player.video.muted = true;
+        player.video.pause();
+      } catch {}
+    }
+
+    markActivityPlaybackDelegated();
+
+    browserDelegated = true;
+    browserPresenceActive = false;
+
+    renderBrowserDelegated();
+  } catch (error) {
+    console.error("[BROWSER MODE]", error);
+
+    if (button) {
+      button.disabled = false;
+      button.textContent = "↗ В браузер";
+      button.title = error?.message || String(error);
+    }
+  }
+}
+
+async function toggleBrowserFullscreen() {
+  if (!IS_BROWSER_MODE) return;
+
+  const target =
+    document.querySelector(".movie-screen") ||
+    document.documentElement;
+
+  try {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+    } else {
+      await target.requestFullscreen();
+    }
+  } catch (error) {
+    console.warn(
+      "[FULLSCREEN]",
+      error?.message || error
+    );
+  }
+}
+
+function setupExternalPlayerControls() {
+  if (player.browserButton) {
+    player.browserButton.onclick = (event) => {
+      event.stopPropagation();
+      requestBrowserLaunch();
+    };
+  }
+
+  if (player.fullscreenButton) {
+    player.fullscreenButton.onclick = (event) => {
+      event.stopPropagation();
+      toggleBrowserFullscreen();
+    };
+
+    const refreshFullscreenButton = () => {
+      if (!player.fullscreenButton) return;
+
+      player.fullscreenButton.textContent =
+        document.fullscreenElement
+          ? "⛶ Выйти"
+          : "⛶ На весь экран";
+    };
+
+    document.addEventListener(
+      "fullscreenchange",
+      refreshFullscreenButton,
+      { once: true }
+    );
+
+    refreshFullscreenButton();
+  }
+}
+
+async function authenticateBrowser() {
+  if (!IS_BROWSER_MODE) {
+    throw new Error("Не браузерный режим.");
+  }
+
+  if (isPhoneLike) {
+    throw new Error(
+      "Браузерный режим Movie Night отключён на телефонах."
+    );
+  }
+
+  const params = new URLSearchParams(
+    window.location.search
+  );
+
+  const ticket = String(
+    params.get("t") || ""
+  ).trim();
+
+  let browserSession = "";
+
+  try {
+    browserSession =
+      sessionStorage.getItem(
+        "movieNightBrowserSession"
+      ) || "";
+  } catch {}
+
+  if (ticket) {
+    const response = await fetch(
+      "/api/browser-session",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          ticket,
+        }),
+      }
+    );
+
+    const json = await response
+      .json()
+      .catch(() => ({}));
+
+    if (
+      !response.ok ||
+      !json.browser_session ||
+      !json.user_id
+    ) {
+      throw new Error(
+        json.error ||
+        "Не удалось открыть браузерную сессию."
+      );
+    }
+
+    browserSession = String(
+      json.browser_session
+    );
+
+    currentDiscordUserId = String(
+      json.user_id
+    );
+
+    try {
+      sessionStorage.setItem(
+        "movieNightBrowserSession",
+        browserSession
+      );
+    } catch {}
+
+    // The one-time ticket disappears from the address bar immediately.
+    history.replaceState(
+      {},
+      "",
+      "/watch"
+    );
+  }
+
+  if (!browserSession) {
+    throw new Error(
+      "Браузерная сессия отсутствует. " +
+      "Открой её кнопкой из Discord Activity."
+    );
+  }
+
+  return browserSession;
+}
+
 function renderIdle() {
   destroyPlayer();
   app.innerHTML = `<main class="screen movie-black"></main>`;
@@ -365,6 +649,10 @@ function destroyPlayer() {
   player.volumeHideTimer = null;
   player.controlsVisible = false;
   player.animeSkipHud = null;
+  player.browserHud = null;
+  player.browserButton = null;
+  player.fullscreenHud = null;
+  player.fullscreenButton = null;
 
   player.timeHud = null;
   player.timeRemainingText = null;
@@ -500,6 +788,38 @@ function renderMovie(state) {
         <span id="volumeValue" class="volume-value">100%</span>
       </div>
 
+      ${
+        !IS_BROWSER_MODE && !isPhoneLike
+          ? `
+            <div id="browserHud" class="browser-hud">
+              <button
+                id="browserButton"
+                type="button"
+                aria-label="Открыть Movie Night в браузере"
+              >
+                ↗ В браузер
+              </button>
+            </div>
+          `
+          : ""
+      }
+
+      ${
+        IS_BROWSER_MODE
+          ? `
+            <div id="fullscreenHud" class="fullscreen-hud">
+              <button
+                id="fullscreenButton"
+                type="button"
+                aria-label="Полноэкранный режим"
+              >
+                ⛶ На весь экран
+              </button>
+            </div>
+          `
+          : ""
+      }
+
       <div
         id="timeHud"
         class="time-hud"
@@ -539,11 +859,21 @@ function renderMovie(state) {
   player.volumeSlider = document.querySelector("#volumeSlider");
   player.volumeValue = document.querySelector("#volumeValue");
 
+  player.browserHud =
+    document.querySelector("#browserHud");
+  player.browserButton =
+    document.querySelector("#browserButton");
+  player.fullscreenHud =
+    document.querySelector("#fullscreenHud");
+  player.fullscreenButton =
+    document.querySelector("#fullscreenButton");
+
   player.timeHud = document.querySelector("#timeHud");
   player.timeRemainingText = document.querySelector("#timeRemainingText");
   player.animeSkipHud = document.querySelector("#animeSkipHud");
 
   setupVolumeControls();
+  setupExternalPlayerControls();
   configureLateJoinIfNeeded(state, key);
 
   if (player.lateJoinSkipButton) {
@@ -1062,6 +1392,38 @@ function renderKodikMovie(state) {
         <span id="volumeValue" class="volume-value">100%</span>
       </div>
 
+      ${
+        !IS_BROWSER_MODE && !isPhoneLike
+          ? `
+            <div id="browserHud" class="browser-hud">
+              <button
+                id="browserButton"
+                type="button"
+                aria-label="Открыть Movie Night в браузере"
+              >
+                ↗ В браузер
+              </button>
+            </div>
+          `
+          : ""
+      }
+
+      ${
+        IS_BROWSER_MODE
+          ? `
+            <div id="fullscreenHud" class="fullscreen-hud">
+              <button
+                id="fullscreenButton"
+                type="button"
+                aria-label="Полноэкранный режим"
+              >
+                ⛶ На весь экран
+              </button>
+            </div>
+          `
+          : ""
+      }
+
       <div
         id="timeHud"
         class="time-hud"
@@ -1111,10 +1473,20 @@ function renderKodikMovie(state) {
   player.volumeSlider = document.querySelector("#volumeSlider");
   player.volumeValue = document.querySelector("#volumeValue");
 
+  player.browserHud =
+    document.querySelector("#browserHud");
+  player.browserButton =
+    document.querySelector("#browserButton");
+  player.fullscreenHud =
+    document.querySelector("#fullscreenHud");
+  player.fullscreenButton =
+    document.querySelector("#fullscreenButton");
+
   player.timeHud = document.querySelector("#timeHud");
   player.timeRemainingText = document.querySelector("#timeRemainingText");
 
   setupVolumeControls();
+  setupExternalPlayerControls();
   bindAnimeSkipVotes();
   updateAnimeSkipHud(state);
   configureLateJoinIfNeeded(state, key);
@@ -1316,6 +1688,7 @@ function isCurrentMovie(key) {
 
 
 function configureLateJoinIfNeeded(state, key) {
+  if (IS_BROWSER_MODE) return;
   if (lateJoinCandidateKey !== key) return;
   if (state?.phase !== "WATCHING" || !state?.startedAt) return;
 
@@ -1495,11 +1868,15 @@ function setupVolumeControls() {
 
   const timeHud = player.timeHud;
   const skipHud = player.animeSkipHud;
+  const browserHud = player.browserHud;
+  const fullscreenHud = player.fullscreenHud;
 
   const hideHud = () => {
     hud.classList.remove("visible");
     timeHud?.classList.remove("visible");
     skipHud?.classList.remove("visible");
+    browserHud?.classList.remove("visible");
+    fullscreenHud?.classList.remove("visible");
     player.controlsVisible = false;
   };
 
@@ -1507,6 +1884,8 @@ function setupVolumeControls() {
     updateTimeRemaining();
     hud.classList.add("visible");
     timeHud?.classList.add("visible");
+    browserHud?.classList.add("visible");
+    fullscreenHud?.classList.add("visible");
     player.controlsVisible = true;
     updateAnimeSkipHud(currentState);
     clearTimeout(player.volumeHideTimer);
@@ -1553,6 +1932,16 @@ function setupVolumeControls() {
   });
 
   skipHud?.addEventListener("pointerdown", (event) => {
+    event.stopPropagation();
+    showHud(3000);
+  });
+
+  browserHud?.addEventListener("pointerdown", (event) => {
+    event.stopPropagation();
+    showHud(3000);
+  });
+
+  fullscreenHud?.addEventListener("pointerdown", (event) => {
     event.stopPropagation();
     showHud(3000);
   });
@@ -3303,6 +3692,14 @@ function renderNextEpisodeVoting(state) {
 function renderState(state) {
   if (!state) return;
 
+  if (
+    !IS_BROWSER_MODE &&
+    browserDelegated
+  ) {
+    renderBrowserDelegated();
+    return;
+  }
+
   if (state.phase === "WATCHING" || state.phase === "PAUSED") {
     setActivityOrientation("movie");
     renderMovie(state);
@@ -3385,14 +3782,11 @@ async function authenticateDiscord() {
   return json.access_token;
 }
 
-function connectBackend(accessToken) {
+function connectBackend(authPayload) {
   socket = io({
     transports: ["websocket", "polling"],
     auth: {
-      accessToken,
-      instanceId: discordSdk.instanceId,
-      guildId: discordSdk.guildId,
-      channelId: discordSdk.channelId,
+      ...authPayload,
       clientBuild: CLIENT_BUILD,
     },
   });
@@ -3424,6 +3818,31 @@ function connectBackend(accessToken) {
     );
   });
 
+  socket.on("browser:presence", ({ active } = {}) => {
+    if (IS_BROWSER_MODE) return;
+
+    browserPresenceActive = Boolean(active);
+
+    if (browserPresenceActive) {
+      browserDelegated = true;
+
+      if (player.video) {
+        try {
+          player.video.muted = true;
+          player.video.pause();
+        } catch {}
+      }
+
+      renderBrowserDelegated();
+      return;
+    }
+
+    if (browserDelegated) {
+      browserDelegated = false;
+      renderState(currentState);
+    }
+  });
+
   socket.on("session:state", (state) => {
     absorbStateClock(state);
 
@@ -3431,6 +3850,7 @@ function connectBackend(accessToken) {
       firstSessionState = false;
 
       if (
+        !IS_BROWSER_MODE &&
         state?.phase === "WATCHING" &&
         state?.movie
       ) {
@@ -3448,11 +3868,35 @@ function connectBackend(accessToken) {
 }
 
 async function boot() {
-  renderBoot("Подключение к Movie Night…");
+  renderBoot(
+    IS_BROWSER_MODE
+      ? "Открываю Movie Night в браузере…"
+      : "Подключение к Movie Night…"
+  );
 
   try {
-    const accessToken = await authenticateDiscord();
-    connectBackend(accessToken);
+    if (IS_BROWSER_MODE) {
+      const browserSession =
+        await authenticateBrowser();
+
+      connectBackend({
+        browserSession,
+        clientKind: "browser",
+      });
+
+      return;
+    }
+
+    const accessToken =
+      await authenticateDiscord();
+
+    connectBackend({
+      accessToken,
+      instanceId: discordSdk.instanceId,
+      guildId: discordSdk.guildId,
+      channelId: discordSdk.channelId,
+      clientKind: "activity",
+    });
   } catch (error) {
     console.error(error);
 
