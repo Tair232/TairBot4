@@ -9,7 +9,7 @@ import unicodedata
 from difflib import SequenceMatcher
 from urllib.parse import urlparse
 
-HELPER_VERSION = "9.29"
+HELPER_VERSION = "9.30"
 
 
 def log(*parts: object) -> None:
@@ -320,9 +320,27 @@ def discover_dubs(extractor: object, title: str, anime_url: str | None) -> dict:
     for option in options:
         option["episode"] = ep_num
 
+    raw_json = getattr(anime, "raw_json", None)
+    if not isinstance(raw_json, dict):
+        raw_json = {}
+
+    raw_alt = raw_json.get("alternateName")
+    if isinstance(raw_alt, list):
+        title_orig = str(raw_alt[0] if raw_alt else "").strip()
+    else:
+        title_orig = str(raw_alt or "").strip()
+
+    published = str(raw_json.get("datePublished") or "").strip()
+    year = None
+    year_match = re.match(r"(\d{4})", published)
+    if year_match:
+        year = int(year_match.group(1))
+
     return {
         "ok": True,
         "matchedTitle": str(getattr(anime, "title", "") or title),
+        "titleOrig": title_orig,
+        "year": year,
         "animeUrl": str(getattr(result, "url", "") or anime_url or ""),
         "episodes": numbers,
         "episodesCount": len(numbers),
