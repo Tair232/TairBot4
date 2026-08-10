@@ -59,15 +59,23 @@ const DUB_VOTING_DURATION_SECONDS = Math.max(
   Number(process.env.DUB_VOTING_DURATION_SECONDS) || 60
 );
 
+const EPISODE_VOTING_DURATION_SECONDS = Math.max(
+  10,
+  Number(process.env.EPISODE_VOTING_DURATION_SECONDS) || 30
+);
+
+const NEXT_EPISODE_VOTING_DURATION_SECONDS = 15;
+const ANIME_OP_SKIP_SECONDS = Math.max(
+  30,
+  Number(process.env.ANIME_OP_SKIP_SECONDS) || 90
+);
+
 const KODIK_API_KEY = String(process.env.KODIK_API_KEY || "").trim();
 
 const KODIK_API_BASE_URL = String(
   process.env.KODIK_API_BASE_URL || "https://kodikapi.com"
 ).replace(/\/+$/, "");
 
-const SHIKIMORI_API_BASE_URL = String(
-  process.env.SHIKIMORI_API_BASE_URL || "https://shikimori.one"
-).replace(/\/+$/, "");
 
 const MOVIE_PRELOAD_SECONDS = Math.max(
   10,
@@ -80,7 +88,7 @@ const LATE_JOIN_PRELOAD_SECONDS = Math.max(
     MOVIE_PRELOAD_SECONDS + 120
 );
 const PORT = Number(process.env.PORT || process.env.SERVER_PORT) || 3000;
-const REQUIRED_CLIENT_BUILD = "9.26";
+const REQUIRED_CLIENT_BUILD = "9.27";
 
 function requireConfig() {
   const missing = [];
@@ -132,6 +140,17 @@ const defaultState = () => ({
   dubVotes: {},
   dubSearching: false,
 
+  episodeVoteEndsAt: null,
+  episodeNumbers: [],
+  episodeVotes: {},
+  selectedDub: null,
+
+  nextEpisodeVoteEndsAt: null,
+  nextEpisodeVotes: {},
+
+  skipVotes: { OP: {}, ED: {} },
+  skipVoteBasePosition: { OP: null, ED: null },
+
   notice: null,
   lastUpdatedAt: Date.now(),
 });
@@ -141,9 +160,15 @@ function normalizeState(raw) {
   const state = { ...base, ...(raw || {}) };
 
   if (
-    !["IDLE", "WATCHING", "PAUSED", "VOTING", "DUB_VOTING"].includes(
-      state.phase
-    )
+    ![
+      "IDLE",
+      "WATCHING",
+      "PAUSED",
+      "VOTING",
+      "DUB_VOTING",
+      "EPISODE_VOTING",
+      "NEXT_EPISODE_VOTING",
+    ].includes(state.phase)
   ) {
     state.phase = "IDLE";
   }
@@ -156,6 +181,26 @@ function normalizeState(raw) {
     state.dubVotes = {};
   }
   state.dubSearching = Boolean(state.dubSearching);
+
+  if (!Array.isArray(state.episodeNumbers)) state.episodeNumbers = [];
+  if (!state.episodeVotes || typeof state.episodeVotes !== "object") {
+    state.episodeVotes = {};
+  }
+  if (!state.nextEpisodeVotes || typeof state.nextEpisodeVotes !== "object") {
+    state.nextEpisodeVotes = {};
+  }
+  if (!state.skipVotes || typeof state.skipVotes !== "object") {
+    state.skipVotes = { OP: {}, ED: {} };
+  }
+  if (!state.skipVotes.OP || typeof state.skipVotes.OP !== "object") {
+    state.skipVotes.OP = {};
+  }
+  if (!state.skipVotes.ED || typeof state.skipVotes.ED !== "object") {
+    state.skipVotes.ED = {};
+  }
+  if (!state.skipVoteBasePosition || typeof state.skipVoteBasePosition !== "object") {
+    state.skipVoteBasePosition = { OP: null, ED: null };
+  }
 
   return state;
 }
@@ -478,79 +523,65 @@ async function searchAnimeTitles(queryText) {
     throw new Error("Введи хотя бы 2 символа.");
   }
 
-  const params = new URLSearchParams({
-    search: queryText,
-    limit: "8",
-    order: "popularity",
-  });
-
-  let response;
+  let stdout = "";
 
   try {
-    response = await fetch(
-      `${SHIKIMORI_API_BASE_URL}/api/animes?${params}`,
+    const result = await runExecFile(
+      "python3",
+      [
+        path.join(ROOT, "anime_sources.py"),
+        "--mode",
+        "search",
+        "--query",
+        queryText,
+      ],
       {
-        method: "GET",
-        redirect: "follow",
-        cache: "no-store",
-        headers: {
-          "Accept": "application/json",
-          "Cache-Control": "no-cache",
-          "Pragma": "no-cache",
-          "User-Agent":
-            "MovieNightDiscordActivity/2.0 (anime title search)",
+        cwd: ROOT,
+        timeout: 25_000,
+        maxBuffer: 1024 * 1024,
+        env: {
+          ...process.env,
+          PYTHONUNBUFFERED: "1",
         },
       }
     );
+
+    stdout = result.stdout;
   } catch (error) {
-    throw new Error(
-      `Shikimori недоступен: ${error?.message || error}`
-    );
+    stdout = String(error?.stdout || "");
+
+    if (!stdout.trim()) {
+      throw new Error(
+        `AnimeGo поиск не запустился: ${error?.message || error}`
+      );
+    }
   }
 
-  const data = await response.json().catch(() => null);
+  let data;
 
-  if (!response.ok) {
-    throw new Error(
-      data?.message ||
-      `Shikimori API HTTP ${response.status}`
-    );
+  try {
+    data = JSON.parse(stdout.trim());
+  } catch {
+    throw new Error("AnimeGo вернул некорректный ответ поиска.");
   }
 
-  if (!Array.isArray(data)) {
-    throw new Error("Shikimori вернул неожиданный ответ.");
+  if (!data?.ok || !Array.isArray(data.results)) {
+    throw new Error(data?.error || "AnimeGo ничего не нашёл.");
   }
 
-  return data
-    .filter((item) => item?.id && (item?.russian || item?.name))
-    .slice(0, 8)
-    .map((item) => {
-      const airedYear =
-        typeof item.aired_on === "string" &&
-        /^\\d{4}/.test(item.aired_on)
-          ? Number(item.aired_on.slice(0, 4))
-          : null;
-
-      const kind = String(item.kind || "").toLowerCase();
-
-      return {
-        key: `shiki:${item.id}`,
-        title: String(item.russian || item.name || "Аниме"),
-        titleOrig: String(item.name || ""),
-        otherTitle: "",
-        year: airedYear,
-        type: kind === "movie" ? "anime" : "anime-serial",
-        shikimoriId: String(item.id),
-        kinopoiskId: null,
-        episodesCount:
-          Number(item.episodes) ||
-          Number(item.episodes_aired) ||
-          null,
-        translationsCount: null,
-        shikimoriKind: kind,
-      };
-    });
+  return data.results.slice(0, 10).map((item) => ({
+    key: `animego:${crypto.randomUUID()}`,
+    title: String(item.title || "Аниме").slice(0, 120),
+    titleOrig: "",
+    animeUrl: String(item.url || ""),
+    thumbnail: String(item.thumbnail || ""),
+    year: null,
+    type: "anime-serial",
+    episodesCount: null,
+    translationsCount: null,
+  }));
 }
+
 async function findAnimeTranslationOptions(anime) {
   if (!KODIK_API_KEY) {
     return [];
@@ -673,6 +704,24 @@ function movieKey(movie) {
   return `vk:${movie.oid}_${movie.id}_${movie.hash || ""}`;
 }
 
+function connectedActivityUserIds() {
+  const ids = new Set();
+
+  if (typeof io === "undefined") return ids;
+
+  for (const socket of io.sockets.sockets.values()) {
+    const userId = socket.data.user?.id;
+    if (userId) ids.add(userId);
+  }
+
+  return ids;
+}
+
+function skipMajorityThreshold() {
+  const viewers = connectedActivityUserIds().size;
+  return Math.max(1, Math.floor(viewers / 2) + 1);
+}
+
 function sanitizeStateFor(userId) {
   const counts = new Map();
 
@@ -695,16 +744,9 @@ function sanitizeStateFor(userId) {
   }));
 
   const dubCounts = new Map();
-
-  for (const option of state.dubOptions) {
-    dubCounts.set(option.id, 0);
-  }
-
+  for (const option of state.dubOptions) dubCounts.set(option.id, 0);
   for (const optionId of Object.values(state.dubVotes)) {
-    dubCounts.set(
-      optionId,
-      (dubCounts.get(optionId) || 0) + 1
-    );
+    dubCounts.set(optionId, (dubCounts.get(optionId) || 0) + 1);
   }
 
   const dubOptions = state.dubOptions.map((item) => ({
@@ -716,9 +758,31 @@ function sanitizeStateFor(userId) {
     votes: dubCounts.get(item.id) || 0,
   }));
 
+  const episodeCounts = new Map();
+  for (const episode of state.episodeNumbers) {
+    episodeCounts.set(Number(episode), 0);
+  }
+  for (const episode of Object.values(state.episodeVotes)) {
+    const value = Number(episode);
+    episodeCounts.set(value, (episodeCounts.get(value) || 0) + 1);
+  }
+
   const mySuggestion = state.suggestions.find(
     (item) => item.proposerUserId === userId
   );
+
+  const opVotes = Object.keys(state.skipVotes?.OP || {}).length;
+  const edVotes = Object.keys(state.skipVotes?.ED || {}).length;
+  const majority = skipMajorityThreshold();
+
+  const nextVotes = {
+    NEXT: Object.values(state.nextEpisodeVotes || {}).filter(
+      (value) => value === "NEXT"
+    ).length,
+    OTHER: Object.values(state.nextEpisodeVotes || {}).filter(
+      (value) => value === "OTHER"
+    ).length,
+  };
 
   return {
     phase: state.phase,
@@ -739,16 +803,40 @@ function sanitizeStateFor(userId) {
           title: state.animeWinner.title,
           titleOrig: state.animeWinner.titleOrig || "",
           year: state.animeWinner.year || null,
-          episodesCount:
-            state.animeWinner.episodesCount || null,
+          episodesCount: state.animeWinner.episodesCount || null,
         }
       : null,
     dubOptions,
     myDubVote: state.dubVotes[userId] || null,
     dubSearching: Boolean(state.dubSearching),
 
-    notice: state.notice || null,
+    episodeVoteEndsAt: state.episodeVoteEndsAt,
+    episodeNumbers: state.episodeNumbers,
+    episodeVoteCounts: [...episodeCounts.entries()].map(
+      ([episode, votes]) => ({ episode, votes })
+    ),
+    myEpisodeVote: Number(state.episodeVotes[userId]) || null,
+    selectedDub: state.selectedDub
+      ? { title: state.selectedDub.title }
+      : null,
 
+    nextEpisodeVoteEndsAt: state.nextEpisodeVoteEndsAt,
+    nextEpisodeVotes: nextVotes,
+    myNextEpisodeVote: state.nextEpisodeVotes[userId] || null,
+
+    skipVote: state.movie?.source === "KODIK"
+      ? {
+          threshold: majority,
+          viewers: connectedActivityUserIds().size,
+          opVotes,
+          edVotes,
+          myOp: Boolean(state.skipVotes?.OP?.[userId]),
+          myEd: Boolean(state.skipVotes?.ED?.[userId]),
+          opSkipSeconds: ANIME_OP_SKIP_SECONDS,
+        }
+      : null,
+
+    notice: state.notice || null,
     serverNow: Date.now(),
     lateJoinPreloadSeconds: LATE_JOIN_PRELOAD_SECONDS,
   };
@@ -1618,22 +1706,25 @@ async function setVoiceStatus(status) {
 
 function desiredVoiceStatus() {
   if (state.phase === "WATCHING" || state.phase === "PAUSED") {
-    const prefix =
-      state.movie?.source === "KODIK"
-        ? "Смотрим аниме"
-        : "Смотрим";
+    if (state.movie?.source === "KODIK") {
+      const episode = Number(state.movie?.episode) || 1;
+      const total = Number(state.movie?.episodesCount) || null;
+      const series = total ? `серия ${episode}/${total}` : `серия ${episode}`;
+      return `Смотрим аниме: ${state.movie?.title || "аниме"} • ${series}`;
+    }
 
-    return `${prefix}: ${state.movie?.title || "видео"}`;
+    return `Смотрим: ${state.movie?.title || "видео"}`;
   }
 
-  if (state.phase === "VOTING") {
-    return "Выбираем фильм или аниме";
-  }
-
+  if (state.phase === "VOTING") return "Выбираем фильм или аниме";
   if (state.phase === "DUB_VOTING") {
-    return `Выбираем озвучку: ${
-      state.animeWinner?.title || "аниме"
-    }`;
+    return `Выбираем озвучку: ${state.animeWinner?.title || "аниме"}`;
+  }
+  if (state.phase === "EPISODE_VOTING") {
+    return `Выбираем серию: ${state.animeWinner?.title || "аниме"}`;
+  }
+  if (state.phase === "NEXT_EPISODE_VOTING") {
+    return `Следующая серия? ${state.movie?.title || "аниме"}`;
   }
 
   return null;
@@ -1957,6 +2048,7 @@ async function startAnime(title, rawUrl, extra = {}) {
   }
 
   const autoStartAt = Date.now() + MOVIE_PRELOAD_SECONDS * 1000;
+  const episode = Math.max(1, Number(extra.episode) || 1);
 
   playbackReports.clear();
 
@@ -1966,6 +2058,7 @@ async function startAnime(title, rawUrl, extra = {}) {
     movie: {
       source: "KODIK",
       title: String(title || "").trim().slice(0, 100),
+      titleOrig: String(extra.titleOrig || "").slice(0, 120),
       url: parsed.url,
       kodikHost: parsed.kodikHost,
       kodikPath: parsed.kodikPath,
@@ -1973,16 +2066,24 @@ async function startAnime(title, rawUrl, extra = {}) {
         ? String(extra.dubTitle).slice(0, 100)
         : null,
       animeKey: extra.animeKey || null,
+      animeUrl: extra.animeUrl || null,
+      episode,
+      episodesCount: Number(extra.episodesCount) || null,
+      episodeNumbers: Array.isArray(extra.episodeNumbers)
+        ? extra.episodeNumbers.map(Number).filter((n) => n > 0)
+        : [],
       duration: null,
     },
     positionSeconds: 0,
     startedAt: null,
     autoStartAt,
+    skipVotes: { OP: {}, ED: {} },
+    skipVoteBasePosition: { OP: null, ED: null },
   };
 
   console.log(
-    `🍥 Anime preload: ${state.movie.title}. ` +
-    `Kodik=${state.movie.kodikPath}. ` +
+    `🍥 Anime preload: ${state.movie.title} • серия ${episode}. ` +
+    `Озвучка=${state.movie.dubTitle || "-"}. ` +
     `Автостарт через ${MOVIE_PRELOAD_SECONDS} сек.`
   );
 
@@ -2122,19 +2223,18 @@ function runExecFile(file, args, options = {}) {
 async function discoverAutomaticDubOptions(anime) {
   const args = [
     path.join(ROOT, "anime_sources.py"),
+    "--mode",
+    "dubs",
     "--title",
     String(anime.title || ""),
-    "--orig",
-    String(anime.titleOrig || ""),
   ];
 
-  if (anime.year) {
-    args.push("--year", String(anime.year));
+  if (anime.animeUrl) {
+    args.push("--anime-url", String(anime.animeUrl));
   }
 
   console.log(
-    `🔎 Auto dub search: ${anime.title} ` +
-    `(Shikimori=${anime.shikimoriId || "-"}, year=${anime.year || "-"})`
+    `🔎 Auto dub search: ${anime.title} (AnimeGo exact=${anime.animeUrl || "-"})`
   );
 
   let stdout = "";
@@ -2153,39 +2253,25 @@ async function discoverAutomaticDubOptions(anime) {
         },
       }
     );
-
     stdout = result.stdout;
   } catch (error) {
-    // The helper intentionally exits non-zero when no sources were found.
-    // Its JSON stdout still contains a useful reason, so parse it first.
     stdout = String(error?.stdout || "");
-
     if (!stdout.trim()) {
       throw new Error(
-        `Автопоиск озвучек не запустился: ${
-          error?.killed
-            ? "таймаут 45 секунд"
-            : error?.message || error
-        }`
+        `Автопоиск озвучек не запустился: ${error?.message || error}`
       );
     }
   }
 
   let data;
-
   try {
     data = JSON.parse(stdout.trim());
   } catch {
-    throw new Error(
-      "Автопоиск озвучек вернул некорректный ответ."
-    );
+    throw new Error("Автопоиск озвучек вернул некорректный ответ.");
   }
 
   if (!data?.ok || !Array.isArray(data.options)) {
-    throw new Error(
-      data?.error ||
-      "AnimeGo не вернул Kodik-озвучки."
-    );
+    throw new Error(data?.error || "AnimeGo не вернул Kodik-озвучки.");
   }
 
   const options = [];
@@ -2193,15 +2279,10 @@ async function discoverAutomaticDubOptions(anime) {
 
   for (const raw of data.options) {
     const parsed = parseKodik(raw?.url);
-
     if (!parsed) continue;
 
-    const title = String(raw?.title || "Озвучка")
-      .trim()
-      .slice(0, 100);
-
+    const title = String(raw?.title || "Озвучка").trim().slice(0, 100);
     const key = `${title.toLowerCase()}|${parsed.url}`;
-
     if (seen.has(key)) continue;
     seen.add(key);
 
@@ -2210,28 +2291,85 @@ async function discoverAutomaticDubOptions(anime) {
       title,
       translationType: "voice",
       link: parsed.url,
-      releaseId: null,
-      episodesCount: anime.episodesCount || null,
       episode: Number(raw?.episode) || 1,
       provider: String(raw?.provider || "AnimeGo/Kodik"),
-      proposerUserId: null,
-      proposerName: null,
-      manual: false,
       createdAt: Date.now() + options.length,
     });
   }
 
   if (!options.length) {
-    throw new Error(
-      "Нашлись источники, но среди них нет поддерживаемых Kodik-ссылок."
-    );
+    throw new Error("Нашлись источники, но среди них нет поддерживаемых Kodik-ссылок.");
   }
 
+  const episodeNumbers = Array.isArray(data.episodes)
+    ? data.episodes.map(Number).filter((n) => Number.isInteger(n) && n > 0)
+    : [1];
+
   console.log(
-    `✅ Auto dub search: ${anime.title} -> ${options.length} Kodik variants`
+    `✅ Auto dub search: ${anime.title} -> ${options.length} Kodik variants, ` +
+    `episodes=${episodeNumbers.length}`
   );
 
-  return options;
+  return {
+    options,
+    episodeNumbers,
+    episodesCount: Number(data.episodesCount) || episodeNumbers.length || 1,
+    animeUrl: String(data.animeUrl || anime.animeUrl || ""),
+    matchedTitle: String(data.matchedTitle || anime.title || ""),
+  };
+}
+
+async function resolveAnimeEpisodeSource(anime, dub, episode) {
+  const args = [
+    path.join(ROOT, "anime_sources.py"),
+    "--mode",
+    "episode",
+    "--title",
+    String(anime.title || ""),
+    "--anime-url",
+    String(anime.animeUrl || ""),
+    "--dub-title",
+    String(dub.title || ""),
+    "--episode",
+    String(episode),
+  ];
+
+  let stdout = "";
+  try {
+    const result = await runExecFile("python3", args, {
+      cwd: ROOT,
+      timeout: 45_000,
+      maxBuffer: 2 * 1024 * 1024,
+      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+    });
+    stdout = result.stdout;
+  } catch (error) {
+    stdout = String(error?.stdout || "");
+    if (!stdout.trim()) {
+      throw new Error(`Не удалось получить серию ${episode}: ${error?.message || error}`);
+    }
+  }
+
+  let data;
+  try {
+    data = JSON.parse(stdout.trim());
+  } catch {
+    throw new Error(`AnimeGo вернул некорректный ответ для серии ${episode}.`);
+  }
+
+  if (!data?.ok || !data?.url) {
+    throw new Error(data?.error || `Не удалось найти серию ${episode} в озвучке ${dub.title}.`);
+  }
+
+  return {
+    url: String(data.url),
+    dubTitle: String(data.title || dub.title),
+    episode: Number(data.episode) || Number(episode),
+    episodeNumbers: Array.isArray(data.episodes)
+      ? data.episodes.map(Number).filter((n) => n > 0)
+      : anime.episodeNumbers || [],
+    episodesCount: Number(data.episodesCount) || anime.episodesCount || null,
+  };
 }
 
 async function populateDubOptions({ isRetry = false } = {}) {
@@ -2254,10 +2392,12 @@ async function populateDubOptions({ isRetry = false } = {}) {
   broadcastState();
 
   let options = [];
+  let discovery = null;
   let discoveryError = null;
 
   try {
-    options = await discoverAutomaticDubOptions(anime);
+    discovery = await discoverAutomaticDubOptions(anime);
+    options = discovery.options;
   } catch (error) {
     discoveryError = error;
     console.warn(
@@ -2294,6 +2434,12 @@ async function populateDubOptions({ isRetry = false } = {}) {
   state.dubOptions = options;
   state.dubVotes = {};
 
+  if (discovery) {
+    state.animeWinner.animeUrl = discovery.animeUrl || state.animeWinner.animeUrl;
+    state.animeWinner.episodeNumbers = discovery.episodeNumbers;
+    state.animeWinner.episodesCount = discovery.episodesCount;
+  }
+
   if (options.length) {
     state.notice = null;
     state.dubVoteEndsAt =
@@ -2319,9 +2465,9 @@ async function startDubVoting(animeSuggestion) {
     titleOrig: animeSuggestion.titleOrig || "",
     year: animeSuggestion.year || null,
     type: animeSuggestion.animeType || null,
-    shikimoriId: animeSuggestion.shikimoriId || null,
-    kinopoiskId: animeSuggestion.kinopoiskId || null,
+    animeUrl: animeSuggestion.animeUrl || null,
     episodesCount: animeSuggestion.episodesCount || null,
+    episodeNumbers: [],
   };
 
   playbackReports.clear();
@@ -2334,19 +2480,14 @@ async function startDubVoting(animeSuggestion) {
     dubOptions: [],
     dubVotes: {},
     dubSearching: true,
-    notice: "Ищу доступные Kodik-озвучки автоматически…",
+    notice: "Ищу доступные озвучки выбранного AnimeGo-тайтла…",
   };
 
-  console.log(
-    `🎙 Anime won: ${anime.title}. Starting automatic dub discovery.`
-  );
+  console.log(`🎙 Anime won: ${anime.title}. Exact AnimeGo=${anime.animeUrl || "-"}`);
 
   saveState();
   broadcastState();
   await syncVoiceStatus();
-
-  // Keep the room in DUB_VOTING while discovery happens, so clients see a
-  // clear loading state instead of remaining on the expired main vote.
   await populateDubOptions();
 }
 
@@ -2378,42 +2519,236 @@ function chooseDubWinner() {
   })[0];
 }
 
-async function finishDubVoting() {
-  if (state.phase !== "DUB_VOTING") {
-    throw new Error(
-      "Сейчас нет голосования за озвучку."
-    );
+async function startEpisodeVoting(anime, dub) {
+  const numbers = Array.isArray(anime.episodeNumbers) && anime.episodeNumbers.length
+    ? anime.episodeNumbers.map(Number).filter((n) => n > 0)
+    : Array.from(
+        { length: Math.max(1, Number(anime.episodesCount) || 1) },
+        (_, index) => index + 1
+      );
+
+  if (numbers.length <= 1) {
+    const episode = numbers[0] || 1;
+    const resolved = await resolveAnimeEpisodeSource(anime, dub, episode);
+    await startAnime(anime.title, resolved.url, {
+      titleOrig: anime.titleOrig,
+      dubTitle: resolved.dubTitle,
+      animeKey: anime.key,
+      animeUrl: anime.animeUrl,
+      episode,
+      episodesCount: resolved.episodesCount || numbers.length,
+      episodeNumbers: resolved.episodeNumbers || numbers,
+    });
+    return;
   }
 
-  if (state.dubSearching) {
-    throw new Error(
-      "Поиск озвучек ещё не завершён."
-    );
+  playbackReports.clear();
+  state = {
+    ...defaultState(),
+    phase: "EPISODE_VOTING",
+    animeWinner: { ...anime, episodeNumbers: numbers, episodesCount: numbers.length },
+    selectedDub: {
+      title: dub.title,
+      provider: dub.provider || "AnimeGo/Kodik",
+    },
+    episodeNumbers: numbers,
+    episodeVotes: {},
+    episodeVoteEndsAt: Date.now() + EPISODE_VOTING_DURATION_SECONDS * 1000,
+    notice: null,
+  };
+
+  saveState();
+  broadcastState();
+  await syncVoiceStatus();
+}
+
+function chooseEpisodeWinner() {
+  const numbers = state.episodeNumbers.map(Number).filter((n) => n > 0);
+  if (!numbers.length) return 1;
+
+  const counts = new Map(numbers.map((n) => [n, 0]));
+  for (const raw of Object.values(state.episodeVotes)) {
+    const episode = Number(raw);
+    if (counts.has(episode)) counts.set(episode, counts.get(episode) + 1);
+  }
+
+  const totalVotes = Object.keys(state.episodeVotes).length;
+  if (!totalVotes) return numbers.includes(1) ? 1 : numbers[0];
+
+  return [...numbers].sort((a, b) => {
+    const diff = (counts.get(b) || 0) - (counts.get(a) || 0);
+    if (diff !== 0) return diff;
+    return a - b;
+  })[0];
+}
+
+async function finishEpisodeVoting() {
+  if (state.phase !== "EPISODE_VOTING") {
+    throw new Error("Сейчас нет голосования за серию.");
   }
 
   const anime = state.animeWinner;
+  const dub = state.selectedDub;
+  if (!anime || !dub) throw new Error("Потеряны данные аниме или озвучки.");
+
+  const episode = chooseEpisodeWinner();
+  const resolved = await resolveAnimeEpisodeSource(anime, dub, episode);
+
+  await startAnime(anime.title, resolved.url, {
+    titleOrig: anime.titleOrig,
+    dubTitle: resolved.dubTitle,
+    animeKey: anime.key,
+    animeUrl: anime.animeUrl,
+    episode,
+    episodesCount: resolved.episodesCount || anime.episodesCount,
+    episodeNumbers: resolved.episodeNumbers || anime.episodeNumbers,
+  });
+
+  return episode;
+}
+
+async function finishDubVoting() {
+  if (state.phase !== "DUB_VOTING") {
+    throw new Error("Сейчас нет голосования за озвучку.");
+  }
+  if (state.dubSearching) throw new Error("Поиск озвучек ещё не завершён.");
+
+  const anime = state.animeWinner;
   const winner = chooseDubWinner();
+  if (!anime) throw new Error("Аниме для голосования потеряно.");
+  if (!winner) throw new Error("Нет доступных Kodik-озвучек.");
 
-  if (!anime) {
-    throw new Error("Аниме для голосования потеряно.");
-  }
-
-  if (!winner) {
-    throw new Error(
-      "Нет доступных Kodik-озвучек. Нажми «Повторить поиск»."
-    );
-  }
-
-  await startAnime(
-    anime.title,
-    winner.link,
-    {
-      dubTitle: winner.title,
-      animeKey: anime.key,
-    }
-  );
-
+  await startEpisodeVoting(anime, winner);
   return winner;
+}
+
+async function startNextEpisodeVoting() {
+  if (!state.movie || state.movie.source !== "KODIK") {
+    await startVoting();
+    return;
+  }
+
+  playbackReports.clear();
+  state.positionSeconds = state.movie.duration || currentPosition();
+  state.startedAt = null;
+  state.autoStartAt = null;
+  state.phase = "NEXT_EPISODE_VOTING";
+  state.nextEpisodeVoteEndsAt = Date.now() + NEXT_EPISODE_VOTING_DURATION_SECONDS * 1000;
+  state.nextEpisodeVotes = {};
+  state.skipVotes = { OP: {}, ED: {} };
+  state.skipVoteBasePosition = { OP: null, ED: null };
+  state.notice = null;
+
+  saveState();
+  broadcastState();
+  await syncVoiceStatus();
+}
+
+async function startNextAnimeEpisode() {
+  const movie = state.movie;
+  if (!movie || movie.source !== "KODIK") {
+    await startVoting();
+    return false;
+  }
+
+  const nextEpisode = (Number(movie.episode) || 1) + 1;
+  const available = Array.isArray(movie.episodeNumbers)
+    ? movie.episodeNumbers.map(Number).filter((n) => n > 0)
+    : [];
+  const maxEpisode = Number(movie.episodesCount) || (available.length ? Math.max(...available) : 0);
+
+  if ((available.length && !available.includes(nextEpisode)) || (maxEpisode && nextEpisode > maxEpisode)) {
+    await startVoting();
+    return false;
+  }
+
+  const anime = {
+    key: movie.animeKey,
+    title: movie.title,
+    titleOrig: movie.titleOrig || "",
+    animeUrl: movie.animeUrl,
+    episodeNumbers: available,
+    episodesCount: maxEpisode || null,
+  };
+  const dub = { title: movie.dubTitle || "" };
+  const resolved = await resolveAnimeEpisodeSource(anime, dub, nextEpisode);
+
+  await startAnime(movie.title, resolved.url, {
+    titleOrig: movie.titleOrig,
+    dubTitle: resolved.dubTitle,
+    animeKey: movie.animeKey,
+    animeUrl: movie.animeUrl,
+    episode: nextEpisode,
+    episodesCount: resolved.episodesCount || maxEpisode,
+    episodeNumbers: resolved.episodeNumbers || available,
+  });
+
+  return true;
+}
+
+async function finishNextEpisodeVoting() {
+  if (state.phase !== "NEXT_EPISODE_VOTING") {
+    throw new Error("Сейчас нет голосования после серии.");
+  }
+
+  const values = Object.values(state.nextEpisodeVotes || {});
+  const next = values.filter((v) => v === "NEXT").length;
+  const other = values.filter((v) => v === "OTHER").length;
+
+  // Requested behavior: no votes -> next episode. A tie also keeps the series
+  // going; "Смотрим другое" must actually beat "Следующая серия".
+  if (other > next) {
+    await startVoting();
+    return "OTHER";
+  }
+
+  const started = await startNextAnimeEpisode();
+  return started ? "NEXT" : "OTHER";
+}
+
+function resetSkipVotes() {
+  state.skipVotes = { OP: {}, ED: {} };
+  state.skipVoteBasePosition = { OP: null, ED: null };
+}
+
+async function applyAnimeSkipVote(kind, userId) {
+  if (state.phase !== "WATCHING" || state.movie?.source !== "KODIK") {
+    throw new Error("Скип доступен только во время просмотра аниме.");
+  }
+
+  kind = String(kind || "").toUpperCase();
+  if (!['OP', 'ED'].includes(kind)) throw new Error("Неизвестный тип скипа.");
+
+  state.skipVotes[kind][userId] = true;
+  if (kind === "OP" && state.skipVoteBasePosition.OP == null) {
+    state.skipVoteBasePosition.OP = currentPosition();
+  }
+
+  const votes = Object.keys(state.skipVotes[kind]).length;
+  const threshold = skipMajorityThreshold();
+
+  if (votes < threshold) {
+    saveState();
+    broadcastState();
+    return { passed: false, votes, threshold };
+  }
+
+  if (kind === "OP") {
+    const base = Math.max(0, Number(state.skipVoteBasePosition.OP) || currentPosition());
+    let target = base + ANIME_OP_SKIP_SECONDS;
+    if (state.movie.duration) {
+      target = Math.min(target, Math.max(0, state.movie.duration - 1));
+    }
+    resetSkipVotes();
+    await seekMovie(target);
+    console.log(`⏭ OP majority ${votes}/${threshold} -> ${formatTime(target)}`);
+    return { passed: true, votes, threshold, target };
+  }
+
+  console.log(`⏭ ED majority ${votes}/${threshold} -> post-episode vote`);
+  resetSkipVotes();
+  await startNextEpisodeVoting();
+  return { passed: true, votes, threshold };
 }
 
 
@@ -2898,7 +3233,9 @@ io.on("connection", (socket) => {
     });
 
     console.log(
-      `🏁 ${user.global_name || user.username} дошёл до конца фильма.`
+      state.movie?.source === "KODIK"
+        ? `🏁 ${user.global_name || user.username} дошёл до конца серии ${state.movie?.episode || 1}.`
+        : `🏁 ${user.global_name || user.username} дошёл до конца фильма.`
     );
   });
 
@@ -3017,8 +3354,7 @@ io.on("connection", (socket) => {
           episodesCount: anime.episodesCount,
           animeType: anime.type,
           animeKey: anime.key,
-          shikimoriId: anime.shikimoriId,
-          kinopoiskId: anime.kinopoiskId,
+          animeUrl: anime.animeUrl,
           proposerUserId: user.id,
           proposerName:
             user.global_name || user.username,
@@ -3181,6 +3517,64 @@ io.on("connection", (socket) => {
     }
   );
 
+  socket.on(
+    "vote:episode-cast",
+    ({ episode } = {}, ack = () => {}) => {
+      try {
+        if (state.phase !== "EPISODE_VOTING") {
+          throw new Error("Сейчас нет голосования за серию.");
+        }
+
+        episode = Number(episode);
+        if (!state.episodeNumbers.includes(episode)) {
+          throw new Error("Такой серии нет в выбранном тайтле.");
+        }
+
+        state.episodeVotes[user.id] = episode;
+        saveState();
+        broadcastState();
+        ack({ ok: true });
+      } catch (error) {
+        ack({ ok: false, error: error?.message || String(error) });
+      }
+    }
+  );
+
+  socket.on(
+    "vote:next-episode",
+    ({ choice } = {}, ack = () => {}) => {
+      try {
+        if (state.phase !== "NEXT_EPISODE_VOTING") {
+          throw new Error("Сейчас нет голосования после серии.");
+        }
+
+        choice = String(choice || "").toUpperCase();
+        if (!['NEXT', 'OTHER'].includes(choice)) {
+          throw new Error("Неизвестный вариант.");
+        }
+
+        state.nextEpisodeVotes[user.id] = choice;
+        saveState();
+        broadcastState();
+        ack({ ok: true });
+      } catch (error) {
+        ack({ ok: false, error: error?.message || String(error) });
+      }
+    }
+  );
+
+  socket.on(
+    "anime:skip-vote",
+    async ({ kind } = {}, ack = () => {}) => {
+      try {
+        const result = await applyAnimeSkipVote(kind, user.id);
+        ack({ ok: true, ...result });
+      } catch (error) {
+        ack({ ok: false, error: error?.message || String(error) });
+      }
+    }
+  );
+
   socket.on("disconnect", () => {
     playbackReports.delete(socket.id);
     animeSearchCache.delete(socket.id);
@@ -3296,13 +3690,18 @@ bot.on("interactionCreate", async (interaction) => {
         const pos = currentPosition();
         const duration = state.movie?.duration;
 
+        const episode = Number(state.movie?.episode) || 1;
+        const total = Number(state.movie?.episodesCount) || null;
+
         await interaction.editReply({
           content:
             `🍥 **${state.movie?.title || "Аниме"}**\n` +
+            `🎞 Серия **${episode}${total ? `/${total}` : ""}**` +
+            `${state.movie?.dubTitle ? ` · 🎙 **${state.movie.dubTitle}**` : ""}\n` +
             `${state.phase === "PAUSED" ? "⏸" : "▶"} ` +
             `${formatTime(pos)}` +
             `${duration ? ` / ${formatTime(duration)}` : ""}`,
-                  });
+        });
         return;
       }
 
@@ -3358,14 +3757,28 @@ bot.on("interactionCreate", async (interaction) => {
     }
 
     if (sub === "skipvote") {
+      if (state.phase === "EPISODE_VOTING") {
+        const episode = await finishEpisodeVoting();
+        await interaction.editReply({
+          content: `🎞 Выбрана серия **${episode}**. Начинается предзагрузка.`,
+        });
+        return;
+      }
+
+      if (state.phase === "NEXT_EPISODE_VOTING") {
+        const choice = await finishNextEpisodeVoting();
+        await interaction.editReply({
+          content: choice === "NEXT" ? "▶ Запускаю следующую серию." : "🗳 Переходим к выбору другого.",
+        });
+        return;
+      }
+
       if (state.phase === "DUB_VOTING") {
         const dub = await finishDubVoting();
 
         await interaction.editReply({
           content:
-            `🎙 Выбрана озвучка **${dub.title}**. ` +
-            `Предзагрузка ${formatTime(MOVIE_PRELOAD_SECONDS)}, ` +
-            `затем общий старт.`,
+            `🎙 Выбрана озвучка **${dub.title}**. Теперь выбираем серию.`,
                   });
         return;
       }
@@ -3434,21 +3847,38 @@ bot.on("interactionCreate", async (interaction) => {
       }
 
       if (state.phase === "DUB_VOTING") {
-        const left = Math.max(
-          0,
-          Math.ceil(
-            (state.dubVoteEndsAt - Date.now()) / 1000
-          )
-        );
-
+        const left = Math.max(0, Math.ceil(((state.dubVoteEndsAt || Date.now()) - Date.now()) / 1000));
         await interaction.editReply({
           content:
-            `🎙 Голосуем за озвучку **${
-              state.animeWinner?.title || "аниме"
-            }**\n` +
+            `🎙 Голосуем за озвучку **${state.animeWinner?.title || "аниме"}**\n` +
             `Озвучек: **${state.dubOptions.length}**\n` +
             `Осталось: **${formatTime(left)}**`,
-                  });
+        });
+        return;
+      }
+
+      if (state.phase === "EPISODE_VOTING") {
+        const left = Math.max(0, Math.ceil(((state.episodeVoteEndsAt || Date.now()) - Date.now()) / 1000));
+        await interaction.editReply({
+          content:
+            `🎞 Выбираем серию **${state.animeWinner?.title || "аниме"}**\n` +
+            `Озвучка: **${state.selectedDub?.title || "-"}**\n` +
+            `Серий: **${state.episodeNumbers.length}** · Осталось: **${formatTime(left)}**`,
+        });
+        return;
+      }
+
+      if (state.phase === "NEXT_EPISODE_VOTING") {
+        const left = Math.max(0, Math.ceil(((state.nextEpisodeVoteEndsAt || Date.now()) - Date.now()) / 1000));
+        const values = Object.values(state.nextEpisodeVotes || {});
+        const next = values.filter((v) => v === "NEXT").length;
+        const other = values.filter((v) => v === "OTHER").length;
+        await interaction.editReply({
+          content:
+            `🍥 Серия **${state.movie?.episode || 1}** закончилась\n` +
+            `Следующая: **${next}** · Другое: **${other}**\n` +
+            `Осталось: **${formatTime(left)}**`,
+        });
         return;
       }
 
@@ -3463,7 +3893,11 @@ bot.on("interactionCreate", async (interaction) => {
 
         await interaction.editReply({
           content:
-            `⏳ **${state.movie?.title || "Фильм"}**\n` +
+            `⏳ **${state.movie?.title || "Фильм"}**${
+              state.movie?.source === "KODIK"
+                ? ` · серия **${state.movie?.episode || 1}${state.movie?.episodesCount ? `/${state.movie.episodesCount}` : ""}**`
+                : ""
+            }\n` +
             `Предзагрузка у зрителей\n` +
             `Общий старт через: **${formatTime(left)}**\n` +
             `Позиция старта: **0:00**`,
@@ -3473,11 +3907,14 @@ bot.on("interactionCreate", async (interaction) => {
 
       await interaction.editReply({
         content:
-          `🎬 **${state.movie?.title || "Фильм"}**\n` +
+          `${state.movie?.source === "KODIK" ? "🍥" : "🎬"} **${state.movie?.title || "Фильм"}**\n` +
+          `${state.movie?.source === "KODIK"
+            ? `🎞 Серия **${state.movie?.episode || 1}${state.movie?.episodesCount ? `/${state.movie.episodesCount}` : ""}**${state.movie?.dubTitle ? ` · 🎙 **${state.movie.dubTitle}**` : ""}\n`
+            : ""}` +
           `${state.phase === "PAUSED" ? "⏸" : "▶"} ` +
           `${formatTime(pos)}` +
           `${duration ? ` / ${formatTime(duration)}` : ""}`,
-              });
+      });
     }
   } catch (error) {
     console.error("Command error:", error);
@@ -3582,7 +4019,11 @@ setInterval(async () => {
     ) {
       if (allActiveViewersFinished()) {
         console.log("🏁 Все активные зрители дошли до конца.");
-        await startVoting();
+        if (state.movie?.source === "KODIK") {
+          await startNextEpisodeVoting();
+        } else {
+          await startVoting();
+        }
         return;
       }
 
@@ -3622,6 +4063,24 @@ setInterval(async () => {
       Date.now() >= state.dubVoteEndsAt
     ) {
       await finishDubVoting();
+      return;
+    }
+
+    if (
+      state.phase === "EPISODE_VOTING" &&
+      state.episodeVoteEndsAt &&
+      Date.now() >= state.episodeVoteEndsAt
+    ) {
+      await finishEpisodeVoting();
+      return;
+    }
+
+    if (
+      state.phase === "NEXT_EPISODE_VOTING" &&
+      state.nextEpisodeVoteEndsAt &&
+      Date.now() >= state.nextEpisodeVoteEndsAt
+    ) {
+      await finishNextEpisodeVoting();
       return;
     }
 
