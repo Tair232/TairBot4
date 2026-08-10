@@ -3,7 +3,7 @@ import { io } from "socket.io-client";
 import Hls from "hls.js";
 import "./style.css";
 
-const CLIENT_BUILD = "9.27";
+const CLIENT_BUILD = "9.29";
 
 const CLIENT_ID = "1535948196663009321";
 const ALLOWED_GUILD_ID = "1492151172570808390";
@@ -772,6 +772,26 @@ function attachKodikHlsSource(movie, key) {
           if (!data?.fatal) return;
 
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            const details = String(data?.details || "");
+
+            if (/manifest/i.test(details)) {
+              try {
+                hls.destroy();
+              } catch {}
+
+              if (player.hls === hls) {
+                player.hls = null;
+              }
+
+              reject(
+                new Error(
+                  `Kodik HLS manifest: ${details || "network error"}`
+                )
+              );
+
+              return;
+            }
+
             try {
               hls.startLoad();
               return;
