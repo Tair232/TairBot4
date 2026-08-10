@@ -3,7 +3,7 @@ import { io } from "socket.io-client";
 import Hls from "hls.js";
 import "./style.css";
 
-const CLIENT_BUILD = "9.26";
+const CLIENT_BUILD = "9.27";
 
 const CLIENT_ID = "1535948196663009321";
 const ALLOWED_GUILD_ID = "1492151172570808390";
@@ -884,11 +884,51 @@ async function loadKodikDirect(state, key) {
   }
 }
 
+function updateAnimeSkipHud(state) {
+  const skip = state?.skipVote;
+  const opButton = document.querySelector("#skipOpButton");
+  const edButton = document.querySelector("#skipEdButton");
+  const opCount = document.querySelector("#skipOpCount");
+  const edCount = document.querySelector("#skipEdCount");
+
+  if (!opButton || !edButton || !skip) return;
+
+  const threshold = Math.max(1, Number(skip.threshold) || 1);
+  if (opCount) opCount.textContent = `${Number(skip.opVotes) || 0}/${threshold}`;
+  if (edCount) edCount.textContent = `${Number(skip.edVotes) || 0}/${threshold}`;
+
+  opButton.classList.toggle("selected", Boolean(skip.myOp));
+  edButton.classList.toggle("selected", Boolean(skip.myEd));
+
+  const enabled = state.phase === "WATCHING" && !state.autoStartAt;
+  opButton.disabled = !enabled;
+  edButton.disabled = !enabled;
+}
+
+function bindAnimeSkipVotes() {
+  for (const [id, kind] of [
+    ["#skipOpButton", "OP"],
+    ["#skipEdButton", "ED"],
+  ]) {
+    const button = document.querySelector(id);
+    if (!button) continue;
+
+    button.onclick = () => {
+      socket.emit("anime:skip-vote", { kind }, (result) => {
+        if (!result?.ok) {
+          console.warn("skip vote:", result?.error);
+        }
+      });
+    };
+  }
+}
+
 function renderKodikMovie(state) {
   const key = movieKey(state.movie);
 
   if (player.key === key && player.video) {
     updatePreloadOverlay(state);
+    updateAnimeSkipHud(state);
 
     const revision = Number(state.seekRevision) || 0;
     const forceExplicitSeek =
@@ -980,6 +1020,15 @@ function renderKodikMovie(state) {
         <strong id="timeRemainingText">--:--</strong>
       </div>
 
+      <div id="animeSkipHud" class="anime-skip-hud">
+        <button id="skipOpButton" type="button">
+          ⏭ OP <span id="skipOpCount">0/1</span>
+        </button>
+        <button id="skipEdButton" type="button">
+          ⏭ ED <span id="skipEdCount">0/1</span>
+        </button>
+      </div>
+
       <button id="tapToPlay" class="tap-to-play" hidden>
         ▶ Нажмите, чтобы начать просмотр
       </button>
@@ -1014,6 +1063,8 @@ function renderKodikMovie(state) {
   player.timeRemainingText = document.querySelector("#timeRemainingText");
 
   setupVolumeControls();
+  bindAnimeSkipVotes();
+  updateAnimeSkipHud(state);
   configureLateJoinIfNeeded(state, key);
 
   if (player.lateJoinSkipButton) {
@@ -1197,6 +1248,7 @@ function renderKodikMovie(state) {
   player.syncTimer = setInterval(() => {
     updatePreloadOverlay(currentState);
     updateTimeRemaining();
+    updateAnimeSkipHud(currentState);
     applyHostState(false);
     emitPlaybackProgress();
   }, 1000);
@@ -1501,11 +1553,6 @@ function setupVolumeControls() {
 function emitPlaybackProgress(forceEnded = false) {
   if (!socket?.connected || !currentState?.movie) return;
   if (movieKey(currentState.movie) !== player.key) return;
-
-  if (currentState.movie.source === "KODIK") {
-    emitKodikProgress(forceEnded);
-    return;
-  }
 
   if (!player.video) return;
 
@@ -2575,15 +2622,7 @@ function renderVoting(state) {
                           item.kind === "ANIME";
 
                         const meta = isAnime
-                          ? [
-                              "🍥 Аниме",
-                              item.year || null,
-                              item.episodesCount
-                                ? `${item.episodesCount} эп.`
-                                : null,
-                            ]
-                              .filter(Boolean)
-                              .join(" · ")
+                          ? "🍥 Аниме · AnimeGo"
                           : "🎬 Фильм";
 
                         return `
@@ -2705,7 +2744,7 @@ function renderVoting(state) {
       }
 
       animeButton.disabled = true;
-      animeStatus.textContent = "Ищу в Kodik…";
+      animeStatus.textContent = "Ищу прямо в AnimeGo…";
 
       socket.emit(
         "anime:search",
@@ -2735,19 +2774,7 @@ function renderVoting(state) {
 
           animeResults.innerHTML = results
             .map((item) => {
-              const details = [
-                item.year || null,
-                item.type === "anime-serial"
-                  ? item.episodesCount
-                    ? `${item.episodesCount} эп.`
-                    : "сериал"
-                  : "фильм",
-                Number(item.translationsCount) > 0
-                  ? `${item.translationsCount} озвуч.`
-                  : null,
-              ]
-                .filter(Boolean)
-                .join(" · ");
+              const details = "AnimeGo · точный результат поиска";
 
               const orig =
                 item.titleOrig &&
@@ -2930,7 +2957,7 @@ function renderDubVoting(state) {
                         ? "вариант"
                         : "вариантов"
                     }.
-                    Голосуй — победитель запустится автоматически.
+                    Голосуй — после этого выберем серию.
                   </div>
 
                   <div class="suggestions dub-suggestions">
@@ -3081,6 +3108,155 @@ function renderDubVoting(state) {
 
 
 
+function remainingEpisodeVoteSeconds(state) {
+  return Math.max(
+    0,
+    Math.ceil((Number(state.episodeVoteEndsAt) - serverNowMs()) / 1000)
+  );
+}
+
+function renderEpisodeVoting(state) {
+  destroyPlayer();
+
+  const numbers = Array.isArray(state.episodeNumbers)
+    ? state.episodeNumbers
+    : [];
+  const counts = new Map(
+    (state.episodeVoteCounts || []).map((item) => [Number(item.episode), Number(item.votes) || 0])
+  );
+
+  app.innerHTML = `
+    <main class="screen voting-screen">
+      <section class="vote-wrap episode-vote-wrap">
+        <header class="vote-header">
+          <div>
+            <div class="vote-kicker">🎞 ВЫБОР СЕРИИ</div>
+            <h1>${esc(state.animeWinner?.title || "Аниме")}</h1>
+            <div class="dub-anime-title">🎙 ${esc(state.selectedDub?.title || "Озвучка")}</div>
+          </div>
+          <div class="vote-timer" id="episodeVoteTimer">${fmt(remainingEpisodeVoteSeconds(state))}</div>
+        </header>
+
+        <section class="vote-panel episode-vote-panel">
+          <div class="episode-grid">
+            ${numbers.map((episode) => `
+              <button
+                type="button"
+                class="episode-choice ${Number(state.myEpisodeVote) === Number(episode) ? "selected" : ""}"
+                data-episode-vote="${Number(episode)}"
+              >
+                <strong>${Number(episode)}</strong>
+                <span>${counts.get(Number(episode)) || 0} голос.</span>
+              </button>
+            `).join("")}
+          </div>
+          <div id="episodeVoteError" class="form-error"></div>
+        </section>
+      </section>
+    </main>
+  `;
+
+  const timer = document.querySelector("#episodeVoteTimer");
+  const interval = setInterval(() => {
+    if (!document.body.contains(timer)) {
+      clearInterval(interval);
+      return;
+    }
+    timer.textContent = fmt(remainingEpisodeVoteSeconds(currentState || state));
+  }, 500);
+
+  document.querySelectorAll("[data-episode-vote]").forEach((button) => {
+    button.onclick = () => {
+      const errorBox = document.querySelector("#episodeVoteError");
+      if (errorBox) errorBox.textContent = "";
+      socket.emit(
+        "vote:episode-cast",
+        { episode: Number(button.dataset.episodeVote) },
+        (result) => {
+          if (!result?.ok && errorBox) {
+            errorBox.textContent = result?.error || "Не удалось проголосовать за серию.";
+          }
+        }
+      );
+    };
+  });
+}
+
+function remainingNextEpisodeVoteSeconds(state) {
+  return Math.max(
+    0,
+    Math.ceil((Number(state.nextEpisodeVoteEndsAt) - serverNowMs()) / 1000)
+  );
+}
+
+function renderNextEpisodeVoting(state) {
+  destroyPlayer();
+
+  const episode = Number(state.movie?.episode) || 1;
+  const nextEpisode = episode + 1;
+  const nextVotes = Number(state.nextEpisodeVotes?.NEXT) || 0;
+  const otherVotes = Number(state.nextEpisodeVotes?.OTHER) || 0;
+
+  app.innerHTML = `
+    <main class="screen voting-screen mini-next-screen">
+      <section class="next-episode-card">
+        <div class="vote-kicker">🍥 СЕРИЯ ${episode} ЗАКОНЧИЛАСЬ</div>
+        <h1>Что дальше?</h1>
+        <div class="vote-timer" id="nextEpisodeTimer">${fmt(remainingNextEpisodeVoteSeconds(state))}</div>
+
+        <div class="next-episode-options">
+          <button
+            class="next-episode-choice ${state.myNextEpisodeVote === "NEXT" ? "selected" : ""}"
+            data-next-choice="NEXT"
+          >
+            <strong>▶ Следующая серия</strong>
+            <span>Серия ${nextEpisode} · ${nextVotes} голос.</span>
+          </button>
+
+          <button
+            class="next-episode-choice ${state.myNextEpisodeVote === "OTHER" ? "selected" : ""}"
+            data-next-choice="OTHER"
+          >
+            <strong>🗳 Смотрим другое</strong>
+            <span>${otherVotes} голос.</span>
+          </button>
+        </div>
+
+        <p class="next-default-note">
+          Если никто не проголосует, автоматически запустится следующая серия.
+        </p>
+        <div id="nextEpisodeError" class="form-error"></div>
+      </section>
+    </main>
+  `;
+
+  const timer = document.querySelector("#nextEpisodeTimer");
+  const interval = setInterval(() => {
+    if (!document.body.contains(timer)) {
+      clearInterval(interval);
+      return;
+    }
+    timer.textContent = fmt(remainingNextEpisodeVoteSeconds(currentState || state));
+  }, 500);
+
+  document.querySelectorAll("[data-next-choice]").forEach((button) => {
+    button.onclick = () => {
+      const errorBox = document.querySelector("#nextEpisodeError");
+      if (errorBox) errorBox.textContent = "";
+      socket.emit(
+        "vote:next-episode",
+        { choice: button.dataset.nextChoice },
+        (result) => {
+          if (!result?.ok && errorBox) {
+            errorBox.textContent = result?.error || "Не удалось проголосовать.";
+          }
+        }
+      );
+    };
+  });
+}
+
+
 /* ---------------- STATE / DISCORD ---------------- */
 
 function renderState(state) {
@@ -3101,6 +3277,18 @@ function renderState(state) {
   if (state.phase === "DUB_VOTING") {
     setActivityOrientation("ui");
     renderDubVoting(state);
+    return;
+  }
+
+  if (state.phase === "EPISODE_VOTING") {
+    setActivityOrientation("ui");
+    renderEpisodeVoting(state);
+    return;
+  }
+
+  if (state.phase === "NEXT_EPISODE_VOTING") {
+    setActivityOrientation("ui");
+    renderNextEpisodeVoting(state);
     return;
   }
 
