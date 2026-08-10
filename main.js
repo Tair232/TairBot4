@@ -1,8 +1,9 @@
 import { DiscordSDK, Common } from "@discord/embedded-app-sdk";
 import { io } from "socket.io-client";
+import Hls from "hls.js";
 import "./style.css";
 
-const CLIENT_BUILD = "9.24";
+const CLIENT_BUILD = "9.26";
 
 const CLIENT_ID = "1535948196663009321";
 const ALLOWED_GUILD_ID = "1492151172570808390";
@@ -118,6 +119,7 @@ async function syncServerClock() {
 const player = {
   key: null,
   video: null,
+  hls: null,
   iframe: null,
   kodikBridgeTimer: null,
   kodikBridgeStartedAt: 0,
@@ -292,6 +294,14 @@ function destroyPlayer() {
   player.playWatchdog = null;
   player.syncTimer = null;
   player.playAttemptPending = false;
+
+  if (player.hls) {
+    try {
+      player.hls.destroy();
+    } catch {}
+  }
+
+  player.hls = null;
 
   if (player.video) {
     try {
@@ -692,405 +702,228 @@ function renderMovie(state) {
 }
 
 
-function kodikProxyPath(movie) {
-  const raw = String(movie?.kodikPath || "");
 
-  if (!raw.startsWith("/")) {
-    throw new Error("Kodik path отсутствует.");
-  }
-
-  const host = String(movie?.kodikHost || "kodik.info").toLowerCase();
-
-  if (host === "kodikplayer.com") {
-    // Discord Activity URL Mapping:
-    // /kodikplayer -> kodikplayer.com
-    return `/kodikplayer${raw}`;
-  }
-
-  // Discord Activity URL Mapping:
-  // /kodik -> kodik.info
-  return `/kodik${raw}`;
-}
-
-
-function parseKodikMessage(raw) {
-  if (raw && typeof raw === "object") {
-    return raw;
-  }
-
-  if (typeof raw !== "string") {
-    return null;
-  }
-
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-function kodikStartPosition(state) {
-  if (!state?.movie) return 0;
-
-  if (
-    state.phase === "PAUSED" &&
-    state.autoStartAt &&
-    !globalPreloadExpired(state)
-  ) {
-    return 0;
-  }
-
-  return Math.max(0, Math.floor(serverPosition(state)));
-}
-
-function buildKodikIframeSrc(movie, startAt = 0) {
-  const mapped = kodikProxyPath(movie);
-  const url = new URL(mapped, window.location.origin);
-
-  // Current public Kodik integrations use these parameters to select the
-  // episode and restore a position without needing same-origin DOM access.
-  if (!url.searchParams.has("episode")) {
-    url.searchParams.set(
-      "episode",
-      String(Number(movie?.episode) || 1)
-    );
-  }
-
-  url.searchParams.set(
-    "start_from",
-    String(Math.max(0, Math.floor(Number(startAt) || 0)))
-  );
-
-  if (!url.searchParams.has("hide_selectors")) {
-    url.searchParams.set("hide_selectors", "true");
-  }
-
-  return `${url.pathname}${url.search}${url.hash || ""}`;
-}
-
-function setKodikIframePosition(
-  target,
-  reason = "resync",
-  { force = false } = {}
-) {
-  if (!player.iframe || !currentState?.movie) return;
-  if (currentState.movie.source !== "KODIK") return;
-
-  target = Math.max(0, Math.floor(Number(target) || 0));
-
-  const now = Date.now();
-
-  if (
-    !force &&
-    now - player.kodikLastReloadAt < 10_000
-  ) {
-    return;
-  }
-
-  if (
-    !force &&
-    Number.isFinite(player.kodikLastReloadTarget) &&
-    Math.abs(player.kodikLastReloadTarget - target) < 3
-  ) {
-    return;
-  }
-
-  const src = buildKodikIframeSrc(
-    currentState.movie,
-    target
-  );
-
-  player.kodikLastReloadAt = now;
-  player.kodikLastReloadTarget = target;
-  player.kodikSuspended = false;
-  player.loaded = false;
-
-  setLoader(
-    reason === "explicit-seek"
-      ? `Перемотка Kodik → ${fmt(target)}…`
-      : "Синхронизация Kodik…"
-  );
-
-  diagnostic("kodik-iframe-reload", {
-    mode:
-      `${reason} target=${target}s ` +
-      `build=${CLIENT_BUILD}`,
-  });
-
-  player.iframe.src = src;
-}
-
-function suspendKodikAtCurrentPosition() {
-  if (!player.iframe || player.kodikSuspended) return;
-
-  const target = Math.max(
-    0,
-    Number.isFinite(player.kodikTime)
-      ? player.kodikTime
-      : serverPosition(currentState)
-  );
-
-  player.kodikSuspended = true;
-  player.kodikLastReloadTarget = target;
-
-  diagnostic("kodik-suspend", {
-    mode: `target=${target.toFixed(1)} build=${CLIENT_BUILD}`,
-  });
-
-  // Cross-origin iframe cannot be reliably paused from the parent.
-  // Unloading it is the deterministic pause. Resume recreates it using
-  // start_from=<authoritative room position>.
-  try {
-    player.iframe.src = "about:blank";
-  } catch {}
-
-  hideLoader();
-}
-
-function emitKodikProgress(forceEnded = false) {
-  if (!socket?.connected || !currentState?.movie) return;
-  if (currentState.movie.source !== "KODIK") return;
-  if (movieKey(currentState.movie) !== player.key) return;
-
-  const currentTime = Math.max(
-    0,
-    Number(player.kodikTime) || 0
-  );
-
-  socket.emit("playback:progress", {
-    movieKey: player.key,
-    currentTime,
-    duration: currentState.movie.duration || null,
-    ended: Boolean(forceEnded),
-    buffering: false,
-    loaded: Boolean(player.loaded),
-    participating: true,
-    lateJoin: false,
-  });
-}
-
-function attachKodikMessageBridge(key) {
-  if (player.kodikMessageHandler) {
-    window.removeEventListener(
-      "message",
-      player.kodikMessageHandler
-    );
-  }
-
-  player.kodikMessageSeen = false;
-
-  player.kodikMessageHandler = (event) => {
-    if (!isCurrentMovie(key) || !player.iframe) return;
-
-    if (
-      event.source !== player.iframe.contentWindow
-    ) {
-      return;
+async function fetchKodikStream(movie) {
+  const response = await fetch(
+    `/api/kodik-stream?url=${encodeURIComponent(movie.url)}` +
+    `&t=${Date.now()}`,
+    {
+      cache: "no-store",
     }
+  );
 
-    const message = parseKodikMessage(event.data);
+  const data = await response.json().catch(() => ({}));
 
-    if (!message) return;
+  if (!response.ok || !data?.url) {
+    throw new Error(
+      data?.error ||
+      `Kodik stream HTTP ${response.status}`
+    );
+  }
 
-    if (!player.kodikMessageSeen) {
-      player.kodikMessageSeen = true;
+  return data;
+}
 
-      diagnostic("kodik-postmessage-found", {
-        mode:
-          `${String(message.key || message.event || "message")} ` +
-          `build=${CLIENT_BUILD}`,
+function attachKodikHlsSource(movie, key) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      setLoader("Получаю HLS Kodik…");
+
+      diagnostic("kodik-hls-resolve", {
+        mode: `build=${CLIENT_BUILD}`,
       });
-    }
 
-    if (message.key === "kodik_player_time_update") {
-      const value = Number(message.value);
+      const stream = await fetchKodikStream(movie);
 
-      if (!Number.isFinite(value) || value < 0) {
+      if (!isCurrentMovie(key) || !player.video) {
+        reject(new Error("stale anime load"));
         return;
       }
 
-      player.kodikTime = value;
-      player.kodikLastTimeAt = Date.now();
-      player.loaded = true;
-      player.buffering = false;
-
-      hideLoader();
-      hideError();
-      emitKodikProgress(false);
-
-      return;
-    }
-
-    // Log the first few other Kodik events so we can discover an end/play/
-    // pause signal without guessing undocumented command names.
-    const marker = String(
-      message.key ||
-      message.event ||
-      message.type ||
-      ""
-    ).toLowerCase();
-
-    if (
-      marker.includes("end") ||
-      marker.includes("finish")
-    ) {
-      diagnostic("kodik-ended-message", {
-        mode: marker.slice(0, 80),
+      diagnostic("kodik-hls-resolved", {
+        quality: Number(stream.quality) || 0,
+        mode: `build=${CLIENT_BUILD}`,
       });
 
-      emitKodikProgress(true);
+      const video = player.video;
 
-      socket?.emit("movie:ended", {
-        movieKey: key,
-      });
-    }
-  };
+      if (Hls.isSupported()) {
+        const hls = new Hls({
+          enableWorker: true,
+          lowLatencyMode: false,
+          backBufferLength: 60,
+          maxBufferLength: 90,
+          maxMaxBufferLength: 180,
+          manifestLoadingTimeOut: 25_000,
+          levelLoadingTimeOut: 25_000,
+          fragLoadingTimeOut: 35_000,
+        });
 
-  window.addEventListener(
-    "message",
-    player.kodikMessageHandler
-  );
-}
+        player.hls = hls;
 
-function syncKodikIframeToHost(state, { force = false } = {}) {
-  if (!player.iframe || !state?.movie) return;
-  if (state.movie.source !== "KODIK") return;
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          diagnostic("kodik-hls-error", {
+            mode:
+              `${data?.type || "?"}/${data?.details || "?"}` +
+              `${data?.fatal ? " fatal" : ""}`,
+            error: data?.error?.message || null,
+          });
 
-  const revision = Number(state.seekRevision) || 0;
+          if (!data?.fatal) return;
 
-  if (revision !== player.appliedSeekRevision) {
-    player.appliedSeekRevision = revision;
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            try {
+              hls.startLoad();
+              return;
+            } catch {}
+          }
 
-    if (
-      state.phase === "PAUSED" &&
-      !state.autoStartAt
-    ) {
-      player.kodikTime = serverPosition(state);
-      player.kodikLastReloadTarget = player.kodikTime;
-      return;
-    }
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            try {
+              hls.recoverMediaError();
+              return;
+            } catch {}
+          }
 
-    setKodikIframePosition(
-      serverPosition(state),
-      "explicit-seek",
-      { force: true }
-    );
-    return;
-  }
+          reject(
+            new Error(
+              `Kodik HLS: ${data?.details || data?.type || "fatal error"}`
+            )
+          );
+        });
 
-  // A real /movie pause: unloading the iframe is the only reliable
-  // cross-origin pause. The scheduled preload pause is NOT suspended.
-  if (
-    state.phase === "PAUSED" &&
-    !state.autoStartAt
-  ) {
-    suspendKodikAtCurrentPosition();
-    player.kodikLastPhase = "PAUSED";
-    return;
-  }
+        hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
+          if (!isCurrentMovie(key)) return;
 
-  if (
-    state.phase === "WATCHING" &&
-    player.kodikSuspended
-  ) {
-    setKodikIframePosition(
-      serverPosition(state),
-      "resume",
-      { force: true }
-    );
+          diagnostic("kodik-hls-manifest", {
+            quality: Number(stream.quality) || 0,
+            mode:
+              `levels=${data?.levels?.length || 0} ` +
+              `build=${CLIENT_BUILD}`,
+          });
 
-    player.kodikLastPhase = "WATCHING";
-    return;
-  }
+          resolve(stream);
+        });
 
-  // When the common 60-second preload expires, force one iframe reload at the
-  // authoritative start position. start_from lets every client join the same
-  // room clock without touching the inner <video>.
-  if (
-    wantsPlayback(state) &&
-    player.kodikLastPhase !== "WATCHING"
-  ) {
-    setKodikIframePosition(
-      serverPosition(state),
-      "common-start",
-      { force: true }
-    );
+        hls.loadSource(stream.url);
+        hls.attachMedia(video);
+        return;
+      }
 
-    player.kodikLastPhase = "WATCHING";
-    return;
-  }
+      if (
+        video.canPlayType(
+          "application/vnd.apple.mpegurl"
+        )
+      ) {
+        video.src = stream.url;
+        video.load();
+        resolve(stream);
+        return;
+      }
 
-  player.kodikLastPhase = state.phase;
-
-  // If Kodik is publishing its own current time, use it as a drift detector.
-  // Resync is intentionally coarse because it requires iframe reload.
-  if (
-    wantsPlayback(state) &&
-    player.kodikLastTimeAt &&
-    Date.now() - player.kodikLastTimeAt < 5000
-  ) {
-    const host = serverPosition(state);
-    const drift = host - Number(player.kodikTime || 0);
-
-    if (force || Math.abs(drift) > 8) {
-      setKodikIframePosition(
-        host,
-        `drift=${drift.toFixed(1)}s`,
-        { force }
+      reject(
+        new Error(
+          "Этот Discord-клиент не поддерживает HLS/MSE."
+        )
       );
+    } catch (error) {
+      reject(error);
     }
-  }
+  });
 }
 
-function beginKodikBridge(state, key) {
-  if (!player.iframe) return;
+async function loadKodikDirect(state, key) {
+  const generation = ++player.loadGeneration;
 
-  attachKodikMessageBridge(key);
+  player.loading = true;
+  player.loaded = false;
 
-  diagnostic("kodik-bridge", {
-    mode: `postMessage build=${CLIENT_BUILD}`,
-  });
+  try {
+    await attachKodikHlsSource(
+      state.movie,
+      key
+    );
 
-  clearInterval(player.kodikBridgeTimer);
-
-  player.kodikBridgeTimer = setInterval(() => {
-    if (!isCurrentMovie(key)) {
-      clearInterval(player.kodikBridgeTimer);
-      player.kodikBridgeTimer = null;
+    if (
+      generation !== player.loadGeneration ||
+      !isCurrentMovie(key)
+    ) {
       return;
     }
 
-    updatePreloadOverlay(currentState);
-    syncKodikIframeToHost(currentState);
-    emitKodikProgress(false);
-  }, 1000);
+    player.loading = false;
+
+    setLoader("Буферизация аниме…");
+  } catch (error) {
+    if (
+      generation !== player.loadGeneration ||
+      !isCurrentMovie(key)
+    ) {
+      return;
+    }
+
+    player.loading = false;
+    player.loaded = false;
+
+    diagnostic("kodik-direct-load-failed", {
+      error: error?.message || error,
+      mode: `build=${CLIENT_BUILD}`,
+    });
+
+    showError(
+      `${error?.message || error}. Повтор через 5 секунд…`
+    );
+
+    clearTimeout(player.retryTimer);
+
+    player.retryTimer = setTimeout(() => {
+      if (!isCurrentMovie(key)) return;
+      hideError();
+      loadKodikDirect(currentState, key);
+    }, 5000);
+  }
 }
 
 function renderKodikMovie(state) {
   const key = movieKey(state.movie);
 
-  if (player.key === key && player.iframe) {
+  if (player.key === key && player.video) {
     updatePreloadOverlay(state);
-    syncKodikIframeToHost(state);
+
+    const revision = Number(state.seekRevision) || 0;
+    const forceExplicitSeek =
+      player.loaded &&
+      revision !== player.appliedSeekRevision;
+
+    applyHostState(forceExplicitSeek);
+
+    if (forceExplicitSeek) {
+      player.appliedSeekRevision = revision;
+
+      diagnostic("kodik-explicit-seek", {
+        mode:
+          `revision=${revision} build=${CLIENT_BUILD}`,
+      });
+    }
+
     return;
   }
 
   destroyPlayer();
 
   app.innerHTML = `
-    <main class="screen movie-screen kodik-screen">
-      <iframe
-        id="kodikFrame"
-        class="kodik-frame"
-        title="Kodik Anime Player"
-        allow="autoplay; fullscreen; picture-in-picture"
-        referrerpolicy="no-referrer-when-downgrade"
-      ></iframe>
+    <main class="screen movie-screen">
+      <video
+        id="movieVideo"
+        playsinline
+        preload="auto"
+        disablepictureinpicture
+      ></video>
 
       <div id="movieLoader" class="movie-loader">
         <div class="loader-inner">
           <div class="spinner"></div>
-          <span id="movieLoaderText">Загрузка Kodik…</span>
+          <span id="movieLoaderText">Подключаю Kodik HLS…</span>
         </div>
       </div>
 
@@ -1152,14 +985,14 @@ function renderKodikMovie(state) {
       </button>
 
       <div id="movieError" class="movie-error" hidden>
-        <strong>Не удалось подключить Kodik</strong>
-        <span id="movieErrorText">Проверяю плеер…</span>
+        <strong>Не удалось загрузить аниме</strong>
+        <span id="movieErrorText">Повторяю попытку…</span>
       </div>
     </main>
   `;
 
   player.key = key;
-  player.iframe = document.querySelector("#kodikFrame");
+  player.video = document.querySelector("#movieVideo");
   player.tap = document.querySelector("#tapToPlay");
   player.loader = document.querySelector("#movieLoader");
   player.loaderText = document.querySelector("#movieLoaderText");
@@ -1180,65 +1013,193 @@ function renderKodikMovie(state) {
   player.timeHud = document.querySelector("#timeHud");
   player.timeRemainingText = document.querySelector("#timeRemainingText");
 
-  // Kodik is cross-origin. The VK-only late-join prebuffer mode relies on
-  // direct <video> access, so for Kodik we join at the authoritative room
-  // position using start_from instead.
-  player.lateJoinActive = false;
-  player.lateJoinStarted = true;
+  setupVolumeControls();
+  configureLateJoinIfNeeded(state, key);
 
   if (player.lateJoinSkipButton) {
-    player.lateJoinSkipButton.hidden = true;
+    player.lateJoinSkipButton.onclick =
+      skipLateJoinWait;
   }
 
-  // Parent custom volume/play controls cannot manipulate a cross-origin Kodik
-  // video. Keep them hidden; Kodik's own player receives pointer input.
-  if (player.volumeHud) {
-    player.volumeHud.hidden = true;
-  }
-
-  if (player.timeHud) {
-    player.timeHud.hidden = true;
-  }
-
-  if (player.tap) {
-    player.tap.hidden = true;
-  }
+  player.tap.onclick = handleUserPlayGesture;
 
   player.appliedSeekRevision =
     Number(state.seekRevision) || 0;
 
-  player.kodikLastPhase =
-    wantsPlayback(state) ? "WATCHING" : state.phase;
-
   updatePreloadOverlay(state);
 
-  const initialPosition = kodikStartPosition(state);
-  const src = buildKodikIframeSrc(
-    state.movie,
-    initialPosition
+  player.video.addEventListener(
+    "loadedmetadata",
+    () => {
+      if (!isCurrentMovie(key)) return;
+
+      const duration = Number(
+        player.video.duration
+      );
+
+      diagnostic("kodik-metadata", {
+        mode:
+          `duration=${Number.isFinite(duration) ? duration.toFixed(1) : "?"} ` +
+          `build=${CLIENT_BUILD}`,
+      });
+
+      if (
+        Number.isFinite(duration) &&
+        duration > 0
+      ) {
+        socket?.emit("movie:metadata", {
+          movieKey: key,
+          duration,
+        });
+      }
+
+      player.loaded = true;
+      hideLoader();
+      hideError();
+
+      seekToHost(true);
+      applyHostState(true);
+    }
   );
 
-  diagnostic("kodik-iframe-load", {
-    mode:
-      `${src.slice(0, 100)} build=${CLIENT_BUILD}`,
-  });
+  player.video.addEventListener(
+    "loadeddata",
+    () => {
+      if (!isCurrentMovie(key)) return;
 
-  player.iframe.addEventListener("load", () => {
-    if (!isCurrentMovie(key)) return;
+      player.loaded = true;
+      hideLoader();
+      hideError();
+      applyHostState(false);
+    }
+  );
 
-    // iframe "load" means the Kodik document itself is ready. Do NOT keep a
-    // full-screen parent loader while waiting for an inaccessible inner video.
-    player.loaded = true;
-    hideLoader();
-    hideError();
+  player.video.addEventListener(
+    "canplay",
+    () => {
+      if (!isCurrentMovie(key)) return;
 
-    diagnostic("kodik-iframe-loaded", {
-      mode: `build=${CLIENT_BUILD}`,
-    });
-  });
+      player.loaded = true;
+      player.buffering = false;
+      hideLoader();
+      hideError();
+      applyHostState(false);
+    }
+  );
 
-  beginKodikBridge(state, key);
-  player.iframe.src = src;
+  player.video.addEventListener(
+    "playing",
+    () => {
+      if (!isCurrentMovie(key)) return;
+
+      player.firstFrameSeen = true;
+      player.buffering = false;
+      player.playAttemptPending = false;
+
+      clearTimeout(player.playWatchdog);
+      player.playWatchdog = null;
+
+      hideLoader();
+      hideError();
+      hideTap();
+      updatePreloadOverlay(currentState);
+
+      diagnostic("kodik-playing", {
+        mode:
+          `t=${player.video.currentTime.toFixed(1)} ` +
+          `build=${CLIENT_BUILD}`,
+      });
+
+      emitPlaybackProgress();
+    }
+  );
+
+  player.video.addEventListener(
+    "waiting",
+    () => {
+      if (!isCurrentMovie(key)) return;
+
+      player.buffering = true;
+
+      diagnostic("kodik-buffering", {
+        mode:
+          `t=${player.video.currentTime.toFixed(1)} ` +
+          `ahead=${bufferedAhead(player.video).toFixed(1)}`,
+      });
+
+      emitPlaybackProgress();
+    }
+  );
+
+  player.video.addEventListener(
+    "stalled",
+    () => {
+      if (!isCurrentMovie(key)) return;
+
+      player.buffering = true;
+
+      diagnostic("kodik-stalled", {
+        mode:
+          `t=${player.video.currentTime.toFixed(1)}`,
+      });
+
+      emitPlaybackProgress();
+    }
+  );
+
+  player.video.addEventListener(
+    "pause",
+    () => {
+      if (!isCurrentMovie(key)) return;
+
+      if (
+        wantsPlayback(currentState) &&
+        !player.video.ended
+      ) {
+        setTimeout(() => {
+          if (isCurrentMovie(key)) {
+            applyHostState(false);
+          }
+        }, 300);
+      }
+    }
+  );
+
+  player.video.addEventListener(
+    "ended",
+    () => {
+      if (!isCurrentMovie(key)) return;
+
+      emitPlaybackProgress(true);
+
+      socket?.emit("movie:ended", {
+        movieKey: key,
+      });
+    }
+  );
+
+  player.video.addEventListener(
+    "error",
+    () => {
+      if (!isCurrentMovie(key)) return;
+
+      const error = player.video.error;
+
+      diagnostic("kodik-video-error", {
+        error:
+          `code=${error?.code || "?"}`,
+      });
+    }
+  );
+
+  loadKodikDirect(state, key);
+
+  player.syncTimer = setInterval(() => {
+    updatePreloadOverlay(currentState);
+    updateTimeRemaining();
+    applyHostState(false);
+    emitPlaybackProgress();
+  }, 1000);
 }
 
 function isCurrentMovie(key) {
@@ -3203,11 +3164,20 @@ function connectBackend(accessToken) {
       instanceId: discordSdk.instanceId,
       guildId: discordSdk.guildId,
       channelId: discordSdk.channelId,
+      clientBuild: CLIENT_BUILD,
     },
   });
 
   socket.on("connect", () => {
-    console.log("[BACKEND] connected", socket.id);
+    console.log(
+      "[BACKEND] connected",
+      socket.id,
+      `build=${CLIENT_BUILD}`
+    );
+
+    diagnostic("client-build", {
+      mode: `build=${CLIENT_BUILD}`,
+    });
 
     syncServerClock();
 
