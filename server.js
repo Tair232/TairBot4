@@ -2873,18 +2873,33 @@ async function populateDubOptions({ isRetry = false } = {}) {
     state.notice = null;
     state.dubVoteEndsAt =
       Date.now() + DUB_VOTING_DURATION_SECONDS * 1000;
-  } else {
-    state.notice =
-      `Не удалось автоматически найти Kodik-озвучки. ${
-        discoveryError?.message || "Источник временно недоступен."
-      } Нажми «Повторить поиск».`;
 
-    state.dubVoteEndsAt = null;
+    saveState();
+    broadcastState();
+    return true;
   }
+
+  const failedAnimeTitle =
+    anime.title || "выбранного аниме";
+
+  const reason =
+    discoveryError?.message ||
+    "Источник временно недоступен.";
+
+  console.warn(
+    `⚠️ No dubs for ${failedAnimeTitle}. Returning to main voting: ${reason}`
+  );
+
+  await startVoting();
+
+  state.notice =
+    `Для «${failedAnimeTitle}» не удалось найти озвучки. ` +
+    "Вернулись к выбору другого фильма или аниме.";
 
   saveState();
   broadcastState();
-  return options.length > 0;
+
+  return false;
 }
 
 async function startDubVoting(animeSuggestion) {
@@ -4396,6 +4411,16 @@ bot.on("interactionCreate", async (interaction) => {
           content:
             `🎙 Выбрана озвучка **${dub.title}**. Теперь выбираем серию.`,
                   });
+        return;
+      }
+
+      if (state.phase !== "VOTING") {
+        await interaction.editReply({
+          content:
+            "ℹ️ Сейчас голосование не идёт. " +
+            "Команда /movie skipvote работает только во время голосования.",
+        });
+
         return;
       }
 
