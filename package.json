@@ -1,7 +1,7 @@
 {
-  "name": "movie-night-v9-27-anime-series-votes",
+  "name": "movie-night-v9-29-hls-episode-availability",
   "private": true,
-  "version": "2.0.27",
+  "version": "2.0.29",
   "type": "module",
   "scripts": {
     "build": "vite build",
