@@ -1,7 +1,7 @@
 {
-  "name": "movie-night-v9-26-direct-kodik-hls",
+  "name": "movie-night-v9-27-anime-series-votes",
   "private": true,
-  "version": "2.0.26",
+  "version": "2.0.27",
   "type": "module",
   "scripts": {
     "build": "vite build",
