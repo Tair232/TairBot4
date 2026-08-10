@@ -1020,3 +1020,7 @@ input:focus {
     padding: 18px 10px;
   }
 }
+
+
+/* V9.26: Kodik no longer renders in an iframe.
+   Anime uses the same native video surface as movies. */
