@@ -88,7 +88,7 @@ const LATE_JOIN_PRELOAD_SECONDS = Math.max(
     MOVIE_PRELOAD_SECONDS + 120
 );
 const PORT = Number(process.env.PORT || process.env.SERVER_PORT) || 3000;
-const REQUIRED_CLIENT_BUILD = "9.27";
+const REQUIRED_CLIENT_BUILD = "9.29";
 
 function requireConfig() {
   const missing = [];
@@ -1359,6 +1359,79 @@ function rewriteHlsManifest(text, baseUrl, referer) {
     .join("\n");
 }
 
+
+async function probeKodikHlsCandidate(candidate, playerUrl) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => {
+    try {
+      controller.abort();
+    } catch {}
+  }, 12_000);
+
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+      "AppleWebKit/537.36 (KHTML, like Gecko) " +
+      "Chrome/140.0.0.0 Safari/537.36",
+    "Accept":
+      "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+    "Accept-Encoding": "identity",
+    "Referer": playerUrl,
+  };
+
+  try {
+    headers.Origin = new URL(playerUrl).origin;
+  } catch {}
+
+  try {
+    const response = await fetch(String(candidate.url), {
+      method: "GET",
+      redirect: "follow",
+      cache: "no-store",
+      headers,
+      signal: controller.signal,
+    });
+
+    const status = response.status;
+
+    if (!response.ok) {
+      try {
+        await response.body?.cancel();
+      } catch {}
+
+      return {
+        ok: false,
+        status,
+        reason: `HTTP ${status}`,
+      };
+    }
+
+    // A CDN may return HTTP 200 with an HTML error page. Verify that the
+    // candidate is actually an HLS manifest before handing it to hls.js.
+    const text = await response.text();
+    const manifestOk = /^\s*#EXTM3U/m.test(text);
+
+    return {
+      ok: manifestOk,
+      status,
+      reason: manifestOk
+        ? "manifest"
+        : "response is not #EXTM3U",
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      reason:
+        error?.name === "AbortError"
+          ? "timeout"
+          : error?.message || String(error),
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 app.get("/api/kodik-stream", async (req, res) => {
   const playerUrl = String(req.query.url || "");
 
@@ -1431,9 +1504,46 @@ app.get("/api/kodik-stream", async (req, res) => {
       throw new Error("Kodik HLS resolver returned no HTTPS streams");
     }
 
-    const best =
-      videos.find((item) => Number(item.quality) === 720) ||
-      videos[0];
+    let best = null;
+    const probeResults = [];
+
+    for (const candidate of videos) {
+      const probe = await probeKodikHlsCandidate(
+        candidate,
+        playerUrl
+      );
+
+      const quality = Number(candidate.quality) || 0;
+
+      probeResults.push({
+        quality,
+        status: probe.status,
+        ok: probe.ok,
+        reason: probe.reason,
+      });
+
+      console.log(
+        `🔎 KODIK HLS probe ${quality || "?"}p -> ` +
+        `${probe.status || "-"} ${probe.ok ? "OK" : probe.reason}`
+      );
+
+      if (probe.ok) {
+        best = candidate;
+        break;
+      }
+    }
+
+    if (!best) {
+      throw new Error(
+        "Kodik CDN не вернул ни одного рабочего HLS " +
+        `(${probeResults
+          .map(
+            (item) =>
+              `${item.quality || "?"}p:${item.status || item.reason}`
+          )
+          .join(", ")})`
+      );
+    }
 
     const proxied = createAnimeRelayUrl(
       best.url,
@@ -1458,6 +1568,7 @@ app.get("/api/kodik-stream", async (req, res) => {
       available: videos.map((item) => ({
         quality: Number(item.quality) || null,
       })),
+      probes: probeResults,
     });
   } catch (error) {
     console.error(
@@ -2358,7 +2469,32 @@ async function resolveAnimeEpisodeSource(anime, dub, episode) {
   }
 
   if (!data?.ok || !data?.url) {
-    throw new Error(data?.error || `Не удалось найти серию ${episode} в озвучке ${dub.title}.`);
+    const error = new Error(
+      data?.error ||
+      `Не удалось найти серию ${episode} в озвучке ${dub.title}.`
+    );
+
+    error.availableEpisodes = Array.isArray(data?.episodes)
+      ? data.episodes
+          .map(Number)
+          .filter((n) => Number.isInteger(n) && n > 0)
+      : [];
+
+    error.episodesCount =
+      Number(data?.episodesCount) ||
+      error.availableEpisodes.length ||
+      null;
+
+    error.unavailableEpisode =
+      Number(data?.unavailableEpisode) || null;
+
+    error.availableDubs = Array.isArray(data?.availableDubs)
+      ? data.availableDubs
+          .map((value) => String(value || "").trim())
+          .filter(Boolean)
+      : [];
+
+    throw error;
   }
 
   return {
@@ -2589,23 +2725,153 @@ async function finishEpisodeVoting() {
 
   const anime = state.animeWinner;
   const dub = state.selectedDub;
-  if (!anime || !dub) throw new Error("Потеряны данные аниме или озвучки.");
+
+  if (!anime || !dub) {
+    throw new Error("Потеряны данные аниме или озвучки.");
+  }
 
   const episode = chooseEpisodeWinner();
-  const resolved = await resolveAnimeEpisodeSource(anime, dub, episode);
 
-  await startAnime(anime.title, resolved.url, {
-    titleOrig: anime.titleOrig,
-    dubTitle: resolved.dubTitle,
-    animeKey: anime.key,
-    animeUrl: anime.animeUrl,
-    episode,
-    episodesCount: resolved.episodesCount || anime.episodesCount,
-    episodeNumbers: resolved.episodeNumbers || anime.episodeNumbers,
-  });
+  // Claim the expired timer before network work. This prevents session tick
+  // from launching the same resolver again while this one is still running.
+  state.episodeVoteEndsAt = null;
+  state.notice = `Проверяю серию ${episode} в озвучке «${dub.title}»…`;
 
-  return episode;
+  saveState();
+  broadcastState();
+
+  try {
+    const resolved = await resolveAnimeEpisodeSource(
+      anime,
+      dub,
+      episode
+    );
+
+    await startAnime(
+      anime.title,
+      resolved.url,
+      {
+        titleOrig: anime.titleOrig,
+        dubTitle: resolved.dubTitle,
+        animeKey: anime.key,
+        animeUrl: anime.animeUrl,
+        episode,
+        episodesCount:
+          resolved.episodesCount ||
+          anime.episodesCount,
+        episodeNumbers:
+          resolved.episodeNumbers ||
+          anime.episodeNumbers,
+      }
+    );
+
+    return episode;
+  } catch (error) {
+    if (state.phase !== "EPISODE_VOTING") {
+      throw error;
+    }
+
+    let available = Array.isArray(
+      error?.availableEpisodes
+    )
+      ? error.availableEpisodes
+          .map(Number)
+          .filter((n) => Number.isInteger(n) && n > 0)
+      : Array.isArray(state.episodeNumbers)
+        ? state.episodeNumbers
+            .map(Number)
+            .filter((n) => Number.isInteger(n) && n > 0)
+        : [];
+
+    const unavailableEpisode =
+      Number(error?.unavailableEpisode) || null;
+
+    if (unavailableEpisode) {
+      available = available.filter(
+        (value) => value !== unavailableEpisode
+      );
+    }
+
+    available = [...new Set(available)]
+      .sort((a, b) => a - b);
+
+    if (!available.length) {
+      const message =
+        `В озвучке «${dub.title}» больше нет доступных серий. ` +
+        "Возвращаю к выбору другого.";
+
+      await startVoting();
+      state.notice = message;
+      saveState();
+      broadcastState();
+      await syncVoiceStatus();
+
+      console.warn(
+        `⚠️ Episode unavailable: ${anime.title} ` +
+        `dub=${dub.title} ep=${episode}; no episodes left`
+      );
+
+      return null;
+    }
+
+    state.episodeNumbers = available;
+    state.animeWinner = {
+      ...state.animeWinner,
+      episodeNumbers: available,
+      // Keep the catalogue total in the title/status. episodeNumbers is the
+      // currently usable set for this chosen dub.
+      episodesCount:
+        Number(error?.episodesCount) ||
+        Number(state.animeWinner?.episodesCount) ||
+        available.length,
+    };
+
+    for (const [userId, raw] of Object.entries(
+      state.episodeVotes || {}
+    )) {
+      if (!available.includes(Number(raw))) {
+        delete state.episodeVotes[userId];
+      }
+    }
+
+    if (unavailableEpisode) {
+      const dubs = Array.isArray(error?.availableDubs)
+        ? error.availableDubs
+        : [];
+
+      state.notice =
+        `Серия ${unavailableEpisode} недоступна в озвучке ` +
+        `«${dub.title}». Я убрал её из этого голосования.` +
+        (
+          dubs.length
+            ? ` На этой серии есть: ${dubs.slice(0, 6).join(", ")}.`
+            : ""
+        );
+    } else {
+      state.notice =
+        `${error?.message || error} ` +
+        "Список серий обновлён.";
+    }
+
+    state.episodeVoteEndsAt =
+      Date.now() +
+      EPISODE_VOTING_DURATION_SECONDS * 1000;
+
+    saveState();
+    broadcastState();
+    await syncVoiceStatus();
+
+    console.warn(
+      `⚠️ Episode vote refreshed: ${anime.title} ` +
+      `dub=${dub.title} failed=${episode} ` +
+      `remaining=${available.length}`
+    );
+
+    // This is a handled availability problem, not a command/session error.
+    return null;
+  }
 }
+
 
 async function finishDubVoting() {
   if (state.phase !== "DUB_VOTING") {
@@ -2671,7 +2937,33 @@ async function startNextAnimeEpisode() {
     episodesCount: maxEpisode || null,
   };
   const dub = { title: movie.dubTitle || "" };
-  const resolved = await resolveAnimeEpisodeSource(anime, dub, nextEpisode);
+
+  let resolved;
+
+  try {
+    resolved = await resolveAnimeEpisodeSource(
+      anime,
+      dub,
+      nextEpisode
+    );
+  } catch (error) {
+    console.warn(
+      `⚠️ Next episode unavailable: ${movie.title} ` +
+      `ep=${nextEpisode} dub=${dub.title}: ` +
+      `${error?.message || error}`
+    );
+
+    await startVoting();
+    state.notice =
+      `Следующая серия ${nextEpisode} пока недоступна в озвучке ` +
+      `«${dub.title || "выбранной"}». Выбираем другое.`;
+
+    saveState();
+    broadcastState();
+    await syncVoiceStatus();
+
+    return false;
+  }
 
   await startAnime(movie.title, resolved.url, {
     titleOrig: movie.titleOrig,
@@ -3759,9 +4051,14 @@ bot.on("interactionCreate", async (interaction) => {
     if (sub === "skipvote") {
       if (state.phase === "EPISODE_VOTING") {
         const episode = await finishEpisodeVoting();
+
         await interaction.editReply({
-          content: `🎞 Выбрана серия **${episode}**. Начинается предзагрузка.`,
+          content:
+            episode == null
+              ? "⚠️ Эта серия недоступна в выбранной озвучке. Голосование обновлено."
+              : `🎞 Выбрана серия **${episode}**. Начинается предзагрузка.`,
         });
+
         return;
       }
 
