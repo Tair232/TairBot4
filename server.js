@@ -6,6 +6,7 @@ import express from "express";
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
 import { execFile } from "node:child_process";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { Server as SocketIOServer } from "socket.io";
 import {
   Client,
@@ -79,6 +80,7 @@ const LATE_JOIN_PRELOAD_SECONDS = Math.max(
     MOVIE_PRELOAD_SECONDS + 120
 );
 const PORT = Number(process.env.PORT || process.env.SERVER_PORT) || 3000;
+const REQUIRED_CLIENT_BUILD = "9.26";
 
 function requireConfig() {
   const missing = [];
@@ -1102,6 +1104,453 @@ app.get("/api/media", async (req, res) => {
     }
   }
 });
+
+
+const ANIME_HLS_SECRET = randomBytes(32);
+
+function isValidKodikPlayerUrl(raw) {
+  let url;
+
+  try {
+    url = new URL(String(raw || ""));
+  } catch {
+    return false;
+  }
+
+  if (url.protocol !== "https:") return false;
+
+  const host = String(url.hostname || "").toLowerCase();
+
+  if (
+    host !== "kodikplayer.com" &&
+    host !== "kodik.info"
+  ) {
+    return false;
+  }
+
+  return /^\/(?:seria|serial|season|video|film|episode|uv)\/\d+\/[A-Za-z0-9_-]+\/\d{3,4}p\/?$/i
+    .test(url.pathname);
+}
+
+function animeRelaySignature(url, referer) {
+  return createHmac("sha256", ANIME_HLS_SECRET)
+    .update(String(url))
+    .update("\n")
+    .update(String(referer || ""))
+    .digest("base64url");
+}
+
+function createAnimeRelayUrl(url, referer) {
+  const encodedUrl = Buffer
+    .from(String(url), "utf8")
+    .toString("base64url");
+
+  const encodedReferer = Buffer
+    .from(String(referer || ""), "utf8")
+    .toString("base64url");
+
+  const sig = animeRelaySignature(url, referer);
+
+  return (
+    `/api/anime-hls?u=${encodeURIComponent(encodedUrl)}` +
+    `&r=${encodeURIComponent(encodedReferer)}` +
+    `&s=${encodeURIComponent(sig)}`
+  );
+}
+
+function verifyAnimeRelayUrl(encodedUrl, encodedReferer, signature) {
+  let url;
+  let referer;
+
+  try {
+    url = Buffer
+      .from(String(encodedUrl || ""), "base64url")
+      .toString("utf8");
+
+    referer = Buffer
+      .from(String(encodedReferer || ""), "base64url")
+      .toString("utf8");
+  } catch {
+    return null;
+  }
+
+  const expected = Buffer.from(
+    animeRelaySignature(url, referer),
+    "utf8"
+  );
+
+  const actual = Buffer.from(
+    String(signature || ""),
+    "utf8"
+  );
+
+  if (
+    expected.length !== actual.length ||
+    !timingSafeEqual(expected, actual)
+  ) {
+    return null;
+  }
+
+  let parsed;
+
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+
+  if (parsed.protocol !== "https:") {
+    return null;
+  }
+
+  const host = String(parsed.hostname || "").toLowerCase();
+
+  // Signed URLs are generated only by our resolver/manifest rewriter.
+  // Still reject obvious local/private targets.
+  if (
+    host === "localhost" ||
+    host.endsWith(".local") ||
+    host === "127.0.0.1" ||
+    host === "::1" ||
+    /^10\./.test(host) ||
+    /^192\.168\./.test(host) ||
+    /^169\.254\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+  ) {
+    return null;
+  }
+
+  return {
+    url: parsed.toString(),
+    referer,
+  };
+}
+
+function absoluteHlsUrl(value, baseUrl) {
+  try {
+    return new URL(String(value || ""), baseUrl).toString();
+  } catch {
+    return null;
+  }
+}
+
+function rewriteHlsManifest(text, baseUrl, referer) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => {
+      const trimmed = line.trim();
+
+      if (!trimmed) {
+        return line;
+      }
+
+      if (!trimmed.startsWith("#")) {
+        const absolute = absoluteHlsUrl(trimmed, baseUrl);
+
+        return absolute
+          ? createAnimeRelayUrl(absolute, referer)
+          : line;
+      }
+
+      // EXT-X-KEY, EXT-X-MAP, EXT-X-MEDIA, I-FRAME playlists, etc.
+      return line.replace(
+        /URI=(?:"([^"]+)"|([^,]+))/gi,
+        (match, quoted, bare) => {
+          const value = quoted || bare;
+          const absolute = absoluteHlsUrl(value, baseUrl);
+
+          if (!absolute) return match;
+
+          return `URI="${createAnimeRelayUrl(
+            absolute,
+            referer
+          )}"`;
+        }
+      );
+    })
+    .join("\n");
+}
+
+app.get("/api/kodik-stream", async (req, res) => {
+  const playerUrl = String(req.query.url || "");
+
+  if (!isValidKodikPlayerUrl(playerUrl)) {
+    res.status(400).json({
+      error: "Invalid Kodik player URL",
+    });
+    return;
+  }
+
+  console.log(
+    `🍥 KODIK HLS resolve: ${playerUrl.slice(0, 140)}`
+  );
+
+  try {
+    let stdout = "";
+
+    try {
+      const result = await runExecFile(
+        "python3",
+        [
+          path.join(ROOT, "anime_stream.py"),
+          "--url",
+          playerUrl,
+        ],
+        {
+          cwd: ROOT,
+          timeout: 30_000,
+          maxBuffer: 1024 * 1024,
+          env: {
+            ...process.env,
+            PYTHONUNBUFFERED: "1",
+          },
+        }
+      );
+
+      stdout = result.stdout;
+    } catch (error) {
+      stdout = String(error?.stdout || "");
+
+      if (!stdout.trim()) {
+        throw error;
+      }
+    }
+
+    const data = JSON.parse(stdout.trim());
+
+    if (!data?.ok || !Array.isArray(data.videos)) {
+      throw new Error(
+        data?.error || "Kodik HLS resolver returned no streams"
+      );
+    }
+
+    const videos = data.videos
+      .filter((item) => {
+        try {
+          const url = new URL(String(item?.url || ""));
+          return url.protocol === "https:";
+        } catch {
+          return false;
+        }
+      })
+      .sort(
+        (a, b) =>
+          Number(b?.quality || 0) -
+          Number(a?.quality || 0)
+      );
+
+    if (!videos.length) {
+      throw new Error("Kodik HLS resolver returned no HTTPS streams");
+    }
+
+    const best =
+      videos.find((item) => Number(item.quality) === 720) ||
+      videos[0];
+
+    const proxied = createAnimeRelayUrl(
+      best.url,
+      playerUrl
+    );
+
+    console.log(
+      `✅ KODIK HLS: ${Number(best.quality) || "?"}p ` +
+      `host=${new URL(best.url).hostname}`
+    );
+
+    res.setHeader(
+      "Cache-Control",
+      "no-store, no-cache, must-revalidate"
+    );
+
+    res.json({
+      ok: true,
+      quality: Number(best.quality) || null,
+      type: String(best.type || "m3u8"),
+      url: proxied,
+      available: videos.map((item) => ({
+        quality: Number(item.quality) || null,
+      })),
+    });
+  } catch (error) {
+    console.error(
+      "❌ /api/kodik-stream:",
+      error?.message || error
+    );
+
+    res.status(502).json({
+      error:
+        error?.message ||
+        "Kodik HLS resolve failed",
+    });
+  }
+});
+
+app.get("/api/anime-hls", async (req, res) => {
+  const verified = verifyAnimeRelayUrl(
+    req.query.u,
+    req.query.r,
+    req.query.s
+  );
+
+  if (!verified) {
+    res.status(403).send("Invalid anime relay URL");
+    return;
+  }
+
+  const controller = new AbortController();
+
+  req.on("aborted", () => {
+    try {
+      controller.abort();
+    } catch {}
+  });
+
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      try {
+        controller.abort();
+      } catch {}
+    }
+  });
+
+  let upstreamUrl;
+
+  try {
+    upstreamUrl = new URL(verified.url);
+  } catch {
+    res.status(400).send("Bad upstream URL");
+    return;
+  }
+
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+      "AppleWebKit/537.36 (KHTML, like Gecko) " +
+      "Chrome/140.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",
+  };
+
+  if (verified.referer) {
+    headers.Referer = verified.referer;
+
+    try {
+      headers.Origin =
+        new URL(verified.referer).origin;
+    } catch {}
+  }
+
+  if (req.headers.range) {
+    headers.Range = req.headers.range;
+  }
+
+  try {
+    const upstream = await fetch(upstreamUrl, {
+      method: "GET",
+      redirect: "follow",
+      cache: "no-store",
+      headers,
+      signal: controller.signal,
+    });
+
+    if (!upstream.ok && upstream.status !== 206) {
+      console.warn(
+        `⚠️ ANIME HLS upstream ${upstream.status} ` +
+        `${upstreamUrl.hostname}${upstreamUrl.pathname}`
+      );
+
+      res
+        .status(upstream.status)
+        .send(`Anime media upstream HTTP ${upstream.status}`);
+
+      return;
+    }
+
+    const contentType =
+      upstream.headers.get("content-type") || "";
+
+    const isManifest =
+      /mpegurl|m3u8/i.test(contentType) ||
+      /\.m3u8(?:$|\?)/i.test(upstreamUrl.toString());
+
+    res.setHeader(
+      "Cache-Control",
+      "no-store, no-cache, must-revalidate"
+    );
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("X-Movie-Night-Anime-Relay", "1");
+    res.setHeader("X-Accel-Buffering", "no");
+
+    if (isManifest) {
+      const text = await upstream.text();
+
+      const rewritten = rewriteHlsManifest(
+        text,
+        upstreamUrl.toString(),
+        verified.referer
+      );
+
+      res.status(200);
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.apple.mpegurl"
+      );
+      res.send(rewritten);
+      return;
+    }
+
+    for (const name of [
+      "content-type",
+      "content-length",
+      "content-range",
+      "accept-ranges",
+      "etag",
+      "last-modified",
+    ]) {
+      const value = upstream.headers.get(name);
+
+      if (value) {
+        res.setHeader(name, value);
+      }
+    }
+
+    res.status(upstream.status);
+
+    if (!upstream.body) {
+      res.end();
+      return;
+    }
+
+    Readable.fromWeb(upstream.body)
+      .on("error", (error) => {
+        if (error?.name !== "AbortError") {
+          console.error(
+            "❌ Anime HLS relay stream:",
+            error?.message || error
+          );
+        }
+
+        if (res.headersSent) {
+          res.destroy();
+        } else {
+          res.status(502).end();
+        }
+      })
+      .pipe(res);
+  } catch (error) {
+    if (error?.name === "AbortError") return;
+
+    console.error(
+      "❌ /api/anime-hls:",
+      error?.message || error
+    );
+
+    if (!res.headersSent) {
+      res.status(502).send("Anime HLS relay failed");
+    }
+  }
+});
+
 
 // Production: Vite is built into ./dist and served by the same Express app.
 // Development still uses the separate Vite dev server.
@@ -2279,6 +2728,15 @@ io.use(async (socket, next) => {
     const instanceId = String(socket.handshake.auth?.instanceId || "");
     const guildId = String(socket.handshake.auth?.guildId || "");
     const channelId = String(socket.handshake.auth?.channelId || "");
+    const clientBuild = String(socket.handshake.auth?.clientBuild || "");
+
+    if (clientBuild !== REQUIRED_CLIENT_BUILD) {
+      throw new Error(
+        `Клиент Activity устарел (${clientBuild || "unknown"}). ` +
+        `Нужна версия ${REQUIRED_CLIENT_BUILD}. ` +
+        "Полностью закрой Activity и открой заново."
+      );
+    }
 
     if (!accessToken || !instanceId) {
       throw new Error("Нет Activity auth.");
@@ -2326,6 +2784,7 @@ io.use(async (socket, next) => {
 
     socket.data.user = user;
     socket.data.instanceId = instanceId;
+    socket.data.clientBuild = clientBuild;
 
     next();
   } catch (error) {
@@ -2340,7 +2799,10 @@ io.use(async (socket, next) => {
 
 io.on("connection", (socket) => {
   const user = socket.data.user;
-  console.log(`🟢 Activity: ${user.global_name || user.username} (${user.id})`);
+  console.log(
+    `🟢 Activity: ${user.global_name || user.username} (${user.id}) ` +
+    `build=${socket.data.clientBuild || "unknown"}`
+  );
 
   socket.emit("session:state", sanitizeStateFor(user.id));
 
