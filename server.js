@@ -65,10 +65,10 @@ const EPISODE_VOTING_DURATION_SECONDS = Math.max(
 );
 
 const NEXT_EPISODE_VOTING_DURATION_SECONDS = 15;
-const ANIME_OP_SKIP_SECONDS = Math.max(
-  30,
-  Number(process.env.ANIME_OP_SKIP_SECONDS) || 90
-);
+
+// V9.30: OP/ED use real per-episode intervals instead of a fixed +90 sec.
+const ANILIST_GRAPHQL_URL = "https://graphql.anilist.co";
+const ANISKIP_API_BASE_URL = "https://api.aniskip.com/v2";
 
 const KODIK_API_KEY = String(process.env.KODIK_API_KEY || "").trim();
 
@@ -88,7 +88,7 @@ const LATE_JOIN_PRELOAD_SECONDS = Math.max(
     MOVIE_PRELOAD_SECONDS + 120
 );
 const PORT = Number(process.env.PORT || process.env.SERVER_PORT) || 3000;
-const REQUIRED_CLIENT_BUILD = "9.29";
+const REQUIRED_CLIENT_BUILD = "9.30";
 
 function requireConfig() {
   const missing = [];
@@ -149,7 +149,6 @@ const defaultState = () => ({
   nextEpisodeVotes: {},
 
   skipVotes: { OP: {}, ED: {} },
-  skipVoteBasePosition: { OP: null, ED: null },
 
   notice: null,
   lastUpdatedAt: Date.now(),
@@ -198,10 +197,6 @@ function normalizeState(raw) {
   if (!state.skipVotes.ED || typeof state.skipVotes.ED !== "object") {
     state.skipVotes.ED = {};
   }
-  if (!state.skipVoteBasePosition || typeof state.skipVoteBasePosition !== "object") {
-    state.skipVoteBasePosition = { OP: null, ED: null };
-  }
-
   return state;
 }
 
@@ -225,6 +220,8 @@ const playbackReports = new Map();
 // The client only receives opaque result keys; Kodik links stay authoritative
 // on the backend until a proposal is accepted.
 const animeSearchCache = new Map();
+const animeMalIdCache = new Map();
+const animeSkipTimesCache = new Map();
 
 function saveState() {
   state.lastUpdatedAt = Date.now();
@@ -832,7 +829,10 @@ function sanitizeStateFor(userId) {
           edVotes,
           myOp: Boolean(state.skipVotes?.OP?.[userId]),
           myEd: Boolean(state.skipVotes?.ED?.[userId]),
-          opSkipSeconds: ANIME_OP_SKIP_SECONDS,
+          segments: {
+            OP: getAnimeSkipSegment("OP"),
+            ED: getAnimeSkipSegment("ED"),
+          },
         }
       : null,
 
@@ -2149,6 +2149,292 @@ async function startMovie(title, rawUrl) {
   await syncVoiceStatus();
 }
 
+
+function normalizeAnimeLookupText(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function animeLookupTextScore(a, b) {
+  const left = normalizeAnimeLookupText(a);
+  const right = normalizeAnimeLookupText(b);
+
+  if (!left || !right) return 0;
+  if (left === right) return 100;
+  if (left.length >= 5 && right.length >= 5 && (left.includes(right) || right.includes(left))) {
+    return 78;
+  }
+
+  const aWords = new Set(left.split(" "));
+  const bWords = new Set(right.split(" "));
+  const common = [...aWords].filter((word) => bWords.has(word)).length;
+  return Math.round((common / Math.max(aWords.size, bWords.size, 1)) * 68);
+}
+
+async function fetchJsonTimeout(url, options = {}, timeoutMs = 7000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    try { controller.abort(); } catch {}
+  }, timeoutMs);
+
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      const error = new Error(`HTTP ${response.status}`);
+      error.status = response.status;
+      error.data = data;
+      throw error;
+    }
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function resolveAnimeMalId(meta = {}) {
+  const direct = Number(meta.knownMalId);
+  if (Number.isInteger(direct) && direct > 0) return direct;
+
+  const key = [
+    meta.animeUrl || "",
+    meta.titleOrig || "",
+    meta.title || "",
+    Number(meta.episodesCount) || 0,
+    Number(meta.year) || 0,
+  ].join("|");
+
+  if (animeMalIdCache.has(key)) return animeMalIdCache.get(key);
+
+  const queryText = `
+    query ($search: String) {
+      Page(page: 1, perPage: 12) {
+        media(search: $search, type: ANIME) {
+          idMal
+          episodes
+          format
+          seasonYear
+          title { romaji english native }
+          synonyms
+        }
+      }
+    }
+  `;
+
+  const queries = [meta.titleOrig, meta.title]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .filter((value, index, array) =>
+      array.findIndex((other) => normalizeAnimeLookupText(other) === normalizeAnimeLookupText(value)) === index
+    );
+
+  const candidates = new Map();
+
+  for (const query of queries) {
+    try {
+      const data = await fetchJsonTimeout(
+        ANILIST_GRAPHQL_URL,
+        {
+          method: "POST",
+          cache: "no-store",
+          headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          body: JSON.stringify({ query: queryText, variables: { search: query } }),
+        },
+        6500
+      );
+
+      for (const media of data?.data?.Page?.media || []) {
+        const malId = Number(media?.idMal);
+        if (Number.isInteger(malId) && malId > 0) candidates.set(malId, media);
+      }
+    } catch (error) {
+      console.warn(`⚠️ AniList skip-id lookup "${query}":`, error?.message || error);
+    }
+  }
+
+  let best = null;
+  const expectedEpisodes = Number(meta.episodesCount) || 0;
+  const expectedYear = Number(meta.year) || 0;
+
+  for (const [malId, media] of candidates) {
+    const titles = [
+      media?.title?.romaji,
+      media?.title?.english,
+      media?.title?.native,
+      ...(Array.isArray(media?.synonyms) ? media.synonyms : []),
+    ].filter(Boolean);
+
+    let titleScore = 0;
+    for (const sourceTitle of [meta.titleOrig, meta.title]) {
+      for (const candidateTitle of titles) {
+        titleScore = Math.max(titleScore, animeLookupTextScore(sourceTitle, candidateTitle));
+      }
+    }
+
+    let score = titleScore;
+    const candidateEpisodes = Number(media?.episodes) || 0;
+    const candidateYear = Number(media?.seasonYear) || 0;
+
+    if (expectedEpisodes > 1 && media?.format === "MOVIE") score -= 120;
+    if (expectedEpisodes && candidateEpisodes) {
+      if (expectedEpisodes === candidateEpisodes) score += 45;
+      else score -= Math.min(48, Math.abs(expectedEpisodes - candidateEpisodes) * 4);
+    }
+    if (expectedYear && candidateYear) {
+      const yearDiff = Math.abs(expectedYear - candidateYear);
+      if (yearDiff === 0) score += 18;
+      else score -= Math.min(30, yearDiff * 12);
+    }
+
+    if (!best || score > best.score) best = { malId, score, titleScore };
+  }
+
+  // Wrong OP/ED timing is worse than having no button at all.
+  const malId = best && best.titleScore >= 55 && best.score >= 62 ? best.malId : null;
+  animeMalIdCache.set(key, malId);
+
+  console.log(
+    malId
+      ? `⏭ AniSkip mapping: "${meta.titleOrig || meta.title}" -> MAL ${malId} score=${best.score}`
+      : `⏭ AniSkip mapping: no safe MAL match for "${meta.titleOrig || meta.title}"`
+  );
+
+  return malId;
+}
+
+function normalizeSkipSegment(raw, kind) {
+  const rawType = String(raw?.skipType || raw?.type || "").toLowerCase();
+  const aliases = kind === "OP" ? new Set(["op", "mixed-op"]) : new Set(["ed", "mixed-ed"]);
+  if (!aliases.has(rawType)) return null;
+
+  const start = Number(raw?.interval?.startTime ?? raw?.startTime ?? raw?.start);
+  const end = Number(raw?.interval?.endTime ?? raw?.endTime ?? raw?.end);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start || end - start > 300) {
+    return null;
+  }
+  return { start, end, type: rawType };
+}
+
+async function fetchAnimeSkipSegments(malId, episode, duration) {
+  const normalizedDuration = Number.isFinite(Number(duration)) && Number(duration) > 0
+    ? Number(duration).toFixed(3)
+    : "0";
+  const cacheKey = `${malId}:${episode}:${normalizedDuration}`;
+  if (animeSkipTimesCache.has(cacheKey)) return animeSkipTimesCache.get(cacheKey);
+
+  const makeUrl = (episodeLength) =>
+    `${ANISKIP_API_BASE_URL}/skip-times/${encodeURIComponent(malId)}/${encodeURIComponent(episode)}` +
+    `?types=op&types=ed&types=mixed-op&types=mixed-ed&episodeLength=${encodeURIComponent(episodeLength)}`;
+
+  let data = null;
+  for (const episodeLength of [...new Set([normalizedDuration, "0"])]) {
+    try {
+      data = await fetchJsonTimeout(
+        makeUrl(episodeLength),
+        { cache: "no-store", headers: { "Accept": "application/json" } },
+        6500
+      );
+      if (data?.found && Array.isArray(data?.results) && data.results.length) break;
+    } catch (error) {
+      if (Number(error?.status) !== 404) {
+        console.warn(`⚠️ AniSkip MAL=${malId} ep=${episode}:`, error?.message || error);
+      }
+    }
+  }
+
+  const rows = Array.isArray(data?.results) ? data.results : [];
+  const result = { OP: null, ED: null };
+
+  for (const row of rows) {
+    const op = normalizeSkipSegment(row, "OP");
+    const ed = normalizeSkipSegment(row, "ED");
+    if (op && !result.OP) result.OP = op;
+    if (ed && !result.ED) result.ED = ed;
+  }
+
+  animeSkipTimesCache.set(cacheKey, result);
+  console.log(
+    `⏭ AniSkip MAL=${malId} ep=${episode}: ` +
+    `OP=${result.OP ? `${result.OP.start.toFixed(2)}-${result.OP.end.toFixed(2)}` : "-"} ` +
+    `ED=${result.ED ? `${result.ED.start.toFixed(2)}-${result.ED.end.toFixed(2)}` : "-"}`
+  );
+  return result;
+}
+
+async function ensureCurrentAnimeSkipSegments() {
+  const movie = state.movie;
+  if (!movie || movie.source !== "KODIK" || !movie.duration) return;
+  if (movie.skipSegmentsStatus === "loading" || movie.skipSegmentsStatus === "ready") return;
+
+  const key = movieKey(movie);
+  movie.skipSegmentsStatus = "loading";
+  saveState();
+
+  try {
+    const malId = await resolveAnimeMalId({
+      knownMalId: movie.animeMalId,
+      title: movie.title,
+      titleOrig: movie.titleOrig,
+      animeUrl: movie.animeUrl,
+      episodesCount: movie.episodesCount,
+      year: movie.animeYear,
+    });
+
+    if (!state.movie || movieKey(state.movie) !== key) return;
+
+    if (!malId) {
+      state.movie.skipSegments = { OP: null, ED: null };
+      state.movie.skipSegmentsStatus = "ready";
+      saveState();
+      broadcastState();
+      return;
+    }
+
+    const segments = await fetchAnimeSkipSegments(
+      malId,
+      Math.max(1, Number(state.movie.episode) || 1),
+      Number(state.movie.duration)
+    );
+
+    if (!state.movie || movieKey(state.movie) !== key) return;
+
+    state.movie.animeMalId = malId;
+    state.movie.skipSegments = segments;
+    state.movie.skipSegmentsStatus = "ready";
+    state.skipVotes = { OP: {}, ED: {} };
+    saveState();
+    broadcastState();
+  } catch (error) {
+    if (!state.movie || movieKey(state.movie) !== key) return;
+    state.movie.skipSegments = { OP: null, ED: null };
+    state.movie.skipSegmentsStatus = "ready";
+    saveState();
+    broadcastState();
+    console.warn("⚠️ OP/ED timing lookup:", error?.message || error);
+  }
+}
+
+function getAnimeSkipSegment(kind) {
+  if (state.movie?.source !== "KODIK") return null;
+  const segment = state.movie?.skipSegments?.[String(kind || "").toUpperCase()];
+  const start = Number(segment?.start);
+  const end = Number(segment?.end);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start) return null;
+  return { start, end };
+}
+
+function animeSkipIsActive(kind, position = currentPosition()) {
+  const segment = getAnimeSkipSegment(kind);
+  if (!segment || !Number.isFinite(Number(position))) return false;
+  position = Number(position);
+  return position >= segment.start - 0.75 && position < segment.end - 0.15;
+}
+
 async function startAnime(title, rawUrl, extra = {}) {
   const parsed = parseKodik(rawUrl);
 
@@ -2178,18 +2464,21 @@ async function startAnime(title, rawUrl, extra = {}) {
         : null,
       animeKey: extra.animeKey || null,
       animeUrl: extra.animeUrl || null,
+      animeYear: Number(extra.year) || null,
+      animeMalId: Number(extra.animeMalId) || null,
       episode,
       episodesCount: Number(extra.episodesCount) || null,
       episodeNumbers: Array.isArray(extra.episodeNumbers)
         ? extra.episodeNumbers.map(Number).filter((n) => n > 0)
         : [],
+      skipSegments: { OP: null, ED: null },
+      skipSegmentsStatus: "idle",
       duration: null,
     },
     positionSeconds: 0,
     startedAt: null,
     autoStartAt,
     skipVotes: { OP: {}, ED: {} },
-    skipVoteBasePosition: { OP: null, ED: null },
   };
 
   console.log(
@@ -2427,6 +2716,8 @@ async function discoverAutomaticDubOptions(anime) {
     episodesCount: Number(data.episodesCount) || episodeNumbers.length || 1,
     animeUrl: String(data.animeUrl || anime.animeUrl || ""),
     matchedTitle: String(data.matchedTitle || anime.title || ""),
+    titleOrig: String(data.titleOrig || anime.titleOrig || ""),
+    year: Number(data.year) || anime.year || null,
   };
 }
 
@@ -2574,6 +2865,8 @@ async function populateDubOptions({ isRetry = false } = {}) {
     state.animeWinner.animeUrl = discovery.animeUrl || state.animeWinner.animeUrl;
     state.animeWinner.episodeNumbers = discovery.episodeNumbers;
     state.animeWinner.episodesCount = discovery.episodesCount;
+    state.animeWinner.titleOrig = discovery.titleOrig || state.animeWinner.titleOrig || "";
+    state.animeWinner.year = discovery.year || state.animeWinner.year || null;
   }
 
   if (options.length) {
@@ -2671,6 +2964,7 @@ async function startEpisodeVoting(anime, dub) {
       dubTitle: resolved.dubTitle,
       animeKey: anime.key,
       animeUrl: anime.animeUrl,
+      year: anime.year,
       episode,
       episodesCount: resolved.episodesCount || numbers.length,
       episodeNumbers: resolved.episodeNumbers || numbers,
@@ -2755,6 +3049,7 @@ async function finishEpisodeVoting() {
         dubTitle: resolved.dubTitle,
         animeKey: anime.key,
         animeUrl: anime.animeUrl,
+        year: anime.year,
         episode,
         episodesCount:
           resolved.episodesCount ||
@@ -2902,7 +3197,6 @@ async function startNextEpisodeVoting() {
   state.nextEpisodeVoteEndsAt = Date.now() + NEXT_EPISODE_VOTING_DURATION_SECONDS * 1000;
   state.nextEpisodeVotes = {};
   state.skipVotes = { OP: {}, ED: {} };
-  state.skipVoteBasePosition = { OP: null, ED: null };
   state.notice = null;
 
   saveState();
@@ -2933,6 +3227,7 @@ async function startNextAnimeEpisode() {
     title: movie.title,
     titleOrig: movie.titleOrig || "",
     animeUrl: movie.animeUrl,
+    year: movie.animeYear || null,
     episodeNumbers: available,
     episodesCount: maxEpisode || null,
   };
@@ -2970,6 +3265,8 @@ async function startNextAnimeEpisode() {
     dubTitle: resolved.dubTitle,
     animeKey: movie.animeKey,
     animeUrl: movie.animeUrl,
+    year: movie.animeYear || null,
+    animeMalId: movie.animeMalId,
     episode: nextEpisode,
     episodesCount: resolved.episodesCount || maxEpisode,
     episodeNumbers: resolved.episodeNumbers || available,
@@ -2998,9 +3295,26 @@ async function finishNextEpisodeVoting() {
   return started ? "NEXT" : "OTHER";
 }
 
-function resetSkipVotes() {
+function resetSkipVotes(kind = null) {
+  if (kind) {
+    const key = String(kind).toUpperCase();
+    if (key === "OP" || key === "ED") state.skipVotes[key] = {};
+    return;
+  }
   state.skipVotes = { OP: {}, ED: {} };
-  state.skipVoteBasePosition = { OP: null, ED: null };
+}
+
+function cleanupInactiveAnimeSkipVotes() {
+  if (state.movie?.source !== "KODIK" || state.phase !== "WATCHING") return false;
+  let changed = false;
+  const position = currentPosition();
+  for (const kind of ["OP", "ED"]) {
+    if (Object.keys(state.skipVotes?.[kind] || {}).length && !animeSkipIsActive(kind, position)) {
+      state.skipVotes[kind] = {};
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 async function applyAnimeSkipVote(kind, userId) {
@@ -3009,38 +3323,39 @@ async function applyAnimeSkipVote(kind, userId) {
   }
 
   kind = String(kind || "").toUpperCase();
-  if (!['OP', 'ED'].includes(kind)) throw new Error("Неизвестный тип скипа.");
+  if (!["OP", "ED"].includes(kind)) throw new Error("Неизвестный тип скипа.");
 
-  state.skipVotes[kind][userId] = true;
-  if (kind === "OP" && state.skipVoteBasePosition.OP == null) {
-    state.skipVoteBasePosition.OP = currentPosition();
+  const segment = getAnimeSkipSegment(kind);
+  if (!segment) {
+    throw new Error(kind === "OP" ? "Для этой серии не найден opening." : "Для этой серии не найден ending.");
   }
 
+  const position = currentPosition();
+  if (!animeSkipIsActive(kind, position)) {
+    throw new Error(kind === "OP" ? "Сейчас opening не идёт." : "Сейчас ending не идёт.");
+  }
+
+  state.skipVotes[kind][userId] = true;
   const votes = Object.keys(state.skipVotes[kind]).length;
   const threshold = skipMajorityThreshold();
 
   if (votes < threshold) {
     saveState();
     broadcastState();
-    return { passed: false, votes, threshold };
+    return { passed: false, votes, threshold, start: segment.start, end: segment.end };
   }
 
-  if (kind === "OP") {
-    const base = Math.max(0, Number(state.skipVoteBasePosition.OP) || currentPosition());
-    let target = base + ANIME_OP_SKIP_SECONDS;
-    if (state.movie.duration) {
-      target = Math.min(target, Math.max(0, state.movie.duration - 1));
-    }
-    resetSkipVotes();
-    await seekMovie(target);
-    console.log(`⏭ OP majority ${votes}/${threshold} -> ${formatTime(target)}`);
-    return { passed: true, votes, threshold, target };
-  }
-
-  console.log(`⏭ ED majority ${votes}/${threshold} -> post-episode vote`);
+  // Skip exactly to the end of the real interval. ED no longer means "finish episode":
+  // any post-credit scene remains playable.
+  const target = Math.max(position, segment.end + 0.05);
   resetSkipVotes();
-  await startNextEpisodeVoting();
-  return { passed: true, votes, threshold };
+  await seekMovie(target);
+  console.log(
+    `⏭ ${kind} majority ${votes}/${threshold}: ` +
+    `${formatTime(position)} -> ${formatTime(target)} ` +
+    `(segment ${formatTime(segment.start)}-${formatTime(segment.end)})`
+  );
+  return { passed: true, votes, threshold, target, start: segment.start, end: segment.end };
 }
 
 
@@ -3502,6 +3817,10 @@ io.on("connection", (socket) => {
       saveState();
       broadcastState();
       console.log(`⏱ Duration: ${formatTime(duration)}`);
+    }
+
+    if (state.movie?.source === "KODIK") {
+      void ensureCurrentAnimeSkipSegments();
     }
   });
 
@@ -4307,6 +4626,15 @@ setInterval(async () => {
       broadcastState();
       await syncVoiceStatus();
       return;
+    }
+
+    if (
+      state.phase === "WATCHING" &&
+      state.movie?.source === "KODIK" &&
+      cleanupInactiveAnimeSkipVotes()
+    ) {
+      saveState();
+      broadcastState();
     }
 
     if (
