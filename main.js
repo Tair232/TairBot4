@@ -3,7 +3,7 @@ import { io } from "socket.io-client";
 import Hls from "hls.js";
 import "./style.css";
 
-const CLIENT_BUILD = "9.29";
+const CLIENT_BUILD = "9.30";
 
 const CLIENT_ID = "1535948196663009321";
 const ALLOWED_GUILD_ID = "1492151172570808390";
@@ -171,6 +171,7 @@ const player = {
   volumeSlider: null,
   volumeHideTimer: null,
   controlsVisible: false,
+  animeSkipHud: null,
 
   timeHud: null,
   timeRemainingText: null,
@@ -363,6 +364,7 @@ function destroyPlayer() {
   player.volumeValue = null;
   player.volumeHideTimer = null;
   player.controlsVisible = false;
+  player.animeSkipHud = null;
 
   player.timeHud = null;
   player.timeRemainingText = null;
@@ -539,6 +541,7 @@ function renderMovie(state) {
 
   player.timeHud = document.querySelector("#timeHud");
   player.timeRemainingText = document.querySelector("#timeRemainingText");
+  player.animeSkipHud = document.querySelector("#animeSkipHud");
 
   setupVolumeControls();
   configureLateJoinIfNeeded(state, key);
@@ -904,14 +907,38 @@ async function loadKodikDirect(state, key) {
   }
 }
 
+function activeAnimeSkipKind(state) {
+  if (!state?.movie || state.movie.source !== "KODIK" || state.phase !== "WATCHING" || state.autoStartAt || !player.video) {
+    return null;
+  }
+
+  const position = Number(player.video.currentTime);
+  if (!Number.isFinite(position)) return null;
+
+  const segments = state?.skipVote?.segments || state?.movie?.skipSegments || {};
+  for (const kind of ["OP", "ED"]) {
+    const segment = segments?.[kind];
+    const start = Number(segment?.start);
+    const end = Number(segment?.end);
+    if (Number.isFinite(start) && Number.isFinite(end) && position >= start - 0.5 && position < end - 0.15) {
+      return kind;
+    }
+  }
+  return null;
+}
+
 function updateAnimeSkipHud(state) {
   const skip = state?.skipVote;
+  const hud = player.animeSkipHud || document.querySelector("#animeSkipHud");
   const opButton = document.querySelector("#skipOpButton");
   const edButton = document.querySelector("#skipEdButton");
   const opCount = document.querySelector("#skipOpCount");
   const edCount = document.querySelector("#skipEdCount");
 
-  if (!opButton || !edButton || !skip) return;
+  if (!hud || !opButton || !edButton || !skip) {
+    if (hud) hud.hidden = true;
+    return;
+  }
 
   const threshold = Math.max(1, Number(skip.threshold) || 1);
   if (opCount) opCount.textContent = `${Number(skip.opVotes) || 0}/${threshold}`;
@@ -920,10 +947,15 @@ function updateAnimeSkipHud(state) {
   opButton.classList.toggle("selected", Boolean(skip.myOp));
   edButton.classList.toggle("selected", Boolean(skip.myEd));
 
-  const enabled = state.phase === "WATCHING" && !state.autoStartAt;
-  opButton.disabled = !enabled;
-  edButton.disabled = !enabled;
+  const activeKind = activeAnimeSkipKind(state);
+  opButton.hidden = activeKind !== "OP";
+  edButton.hidden = activeKind !== "ED";
+  opButton.disabled = activeKind !== "OP";
+  edButton.disabled = activeKind !== "ED";
+  hud.hidden = !activeKind;
+  hud.classList.toggle("visible", Boolean(activeKind && player.controlsVisible));
 }
+
 
 function bindAnimeSkipVotes() {
   for (const [id, kind] of [
@@ -1040,12 +1072,12 @@ function renderKodikMovie(state) {
         <strong id="timeRemainingText">--:--</strong>
       </div>
 
-      <div id="animeSkipHud" class="anime-skip-hud">
-        <button id="skipOpButton" type="button">
-          ⏭ OP <span id="skipOpCount">0/1</span>
+      <div id="animeSkipHud" class="anime-skip-hud" hidden>
+        <button id="skipOpButton" type="button" hidden>
+          ⏭ Пропустить OP <span id="skipOpCount">0/1</span>
         </button>
-        <button id="skipEdButton" type="button">
-          ⏭ ED <span id="skipEdCount">0/1</span>
+        <button id="skipEdButton" type="button" hidden>
+          ⏭ Пропустить ED <span id="skipEdCount">0/1</span>
         </button>
       </div>
 
@@ -1435,72 +1467,61 @@ function setupVolumeControls() {
   if (!video || !hud || !button || !slider || !screen) return;
 
   let savedVolume = 1;
-
+  let savedMuted = false;
   try {
-    const raw = localStorage.getItem("movieNightVolume");
-    const parsed = Number(raw);
-
-    if (Number.isFinite(parsed)) {
-      savedVolume = Math.min(1, Math.max(0, parsed));
-    }
+    const parsed = Number(localStorage.getItem("movieNightVolume"));
+    if (Number.isFinite(parsed)) savedVolume = Math.min(1, Math.max(0, parsed));
+    savedMuted = localStorage.getItem("movieNightMuted") === "1";
   } catch {}
 
+  let lastAudibleVolume = savedVolume > 0.001 ? savedVolume : 0.75;
   video.volume = savedVolume;
-  video.muted = savedVolume <= 0;
-  slider.value = String(Math.round(savedVolume * 100));
+  video.muted = savedMuted || savedVolume <= 0;
 
   const refresh = () => {
-    const effective = video.muted ? 0 : video.volume;
+    const effective = video.muted ? 0 : Math.min(1, Math.max(0, Number(video.volume) || 0));
     const percent = Math.round(effective * 100);
 
-    if (video.muted || video.volume <= 0.001) {
-      button.textContent = "🔇";
-    } else if (video.volume < 0.5) {
-      button.textContent = "🔉";
-    } else {
-      button.textContent = "🔊";
-    }
+    // The thumb, filled track and number always represent the same effective volume.
+    slider.value = String(percent);
+    slider.style.setProperty("--volume-pct", `${percent}%`);
 
-    if (valueLabel) {
-      valueLabel.textContent = `${percent}%`;
-    }
+    if (effective <= 0.001) button.textContent = "🔇";
+    else if (effective < 0.5) button.textContent = "🔉";
+    else button.textContent = "🔊";
+
+    if (valueLabel) valueLabel.textContent = `${percent}%`;
   };
 
   const timeHud = player.timeHud;
+  const skipHud = player.animeSkipHud;
 
   const hideHud = () => {
     hud.classList.remove("visible");
     timeHud?.classList.remove("visible");
+    skipHud?.classList.remove("visible");
     player.controlsVisible = false;
   };
 
   const showHud = (duration = 2200) => {
     updateTimeRemaining();
-
     hud.classList.add("visible");
     timeHud?.classList.add("visible");
     player.controlsVisible = true;
-
+    updateAnimeSkipHud(currentState);
     clearTimeout(player.volumeHideTimer);
-
-    player.volumeHideTimer = setTimeout(() => {
-      hideHud();
-    }, duration);
+    player.volumeHideTimer = setTimeout(hideHud, duration);
   };
 
   slider.addEventListener("input", () => {
-    const next = Math.min(
-      1,
-      Math.max(0, Number(slider.value) / 100)
-    );
-
+    const next = Math.min(1, Math.max(0, Number(slider.value) / 100));
     video.volume = next;
     video.muted = next <= 0;
-
+    if (next > 0.001) lastAudibleVolume = next;
     try {
       localStorage.setItem("movieNightVolume", String(next));
+      localStorage.setItem("movieNightMuted", video.muted ? "1" : "0");
     } catch {}
-
     refresh();
     showHud(3000);
   });
@@ -1509,17 +1530,18 @@ function setupVolumeControls() {
     event.stopPropagation();
 
     if (video.muted || video.volume <= 0.001) {
-      const fallback =
-        Number(slider.value) > 0
-          ? Number(slider.value) / 100
-          : 0.75;
-
-      video.volume = fallback;
+      const restored = Math.min(1, Math.max(0.01, lastAudibleVolume || 0.75));
+      video.volume = restored;
       video.muted = false;
-      slider.value = String(Math.round(fallback * 100));
     } else {
+      lastAudibleVolume = Math.max(0.01, Number(video.volume) || 0.75);
       video.muted = true;
     }
+
+    try {
+      localStorage.setItem("movieNightVolume", String(video.volume));
+      localStorage.setItem("movieNightMuted", video.muted ? "1" : "0");
+    } catch {}
 
     refresh();
     showHud(3000);
@@ -1530,46 +1552,45 @@ function setupVolumeControls() {
     showHud(3000);
   });
 
-  // Desktop: behave like YouTube on mouse movement.
-  screen.addEventListener(
-    "mousemove",
-    () => showHud(1800),
-    { passive: true }
-  );
+  skipHud?.addEventListener("pointerdown", (event) => {
+    event.stopPropagation();
+    showHud(3000);
+  });
 
-  // Phone/tablet: one tap shows controls, another tap on empty movie
-  // while visible can hide them immediately.
+  screen.addEventListener("mousemove", () => showHud(1800), { passive: true });
+
   screen.addEventListener(
     "pointerup",
     (event) => {
       if (!isLikelyTouchDevice) return;
-
       if (
         event.target === slider ||
         event.target === button ||
         event.target.closest?.(".preload-card") ||
-        event.target.closest?.(".tap-to-play")
-      ) {
-        return;
-      }
+        event.target.closest?.(".tap-to-play") ||
+        event.target.closest?.(".anime-skip-hud")
+      ) return;
 
-      if (player.controlsVisible) {
-        hideHud();
-      } else {
-        showHud(3000);
-      }
+      if (player.controlsVisible) hideHud();
+      else showHud(3000);
     },
     { passive: true }
   );
 
-  video.addEventListener("timeupdate", updateTimeRemaining);
-  video.addEventListener("durationchange", updateTimeRemaining);
-  video.addEventListener("loadedmetadata", updateTimeRemaining);
-  video.addEventListener("seeked", updateTimeRemaining);
+  const updateDynamicHud = () => {
+    updateTimeRemaining();
+    updateAnimeSkipHud(currentState);
+  };
 
-  updateTimeRemaining();
+  video.addEventListener("timeupdate", updateDynamicHud);
+  video.addEventListener("durationchange", updateDynamicHud);
+  video.addEventListener("loadedmetadata", updateDynamicHud);
+  video.addEventListener("seeked", updateDynamicHud);
+
+  updateDynamicHud();
   refresh();
 }
+
 function emitPlaybackProgress(forceEnded = false) {
   if (!socket?.connected || !currentState?.movie) return;
   if (movieKey(currentState.movie) !== player.key) return;
