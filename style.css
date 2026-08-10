@@ -1024,3 +1024,149 @@ input:focus {
 
 /* V9.26: Kodik no longer renders in an iframe.
    Anime uses the same native video surface as movies. */
+
+
+/* V9.27 anime episode + skip voting */
+.anime-skip-hud {
+  position: absolute;
+  top: max(16px, env(safe-area-inset-top));
+  right: max(16px, env(safe-area-inset-right));
+  z-index: 18;
+  display: flex;
+  gap: 8px;
+}
+
+.anime-skip-hud button {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  padding: 8px 12px;
+  background: rgba(8, 10, 16, 0.72);
+  color: #fff;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  backdrop-filter: blur(10px);
+}
+
+.anime-skip-hud button.selected {
+  border-color: rgba(255, 255, 255, 0.65);
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.anime-skip-hud button:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+.anime-skip-hud span {
+  opacity: 0.72;
+  margin-left: 4px;
+}
+
+.episode-vote-panel {
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.episode-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+  gap: 10px;
+}
+
+.episode-choice {
+  min-height: 76px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04);
+  color: #fff;
+  display: grid;
+  place-items: center;
+  gap: 2px;
+  cursor: pointer;
+}
+
+.episode-choice strong {
+  font-size: 22px;
+}
+
+.episode-choice span {
+  font-size: 11px;
+  opacity: 0.62;
+}
+
+.episode-choice.selected,
+.next-episode-choice.selected {
+  border-color: rgba(255, 255, 255, 0.7);
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.mini-next-screen {
+  display: grid;
+  place-items: center;
+}
+
+.next-episode-card {
+  width: min(720px, calc(100% - 32px));
+  padding: 28px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 22px;
+  background: rgba(12, 14, 22, 0.94);
+  text-align: center;
+}
+
+.next-episode-card .vote-timer {
+  margin: 14px auto 20px;
+}
+
+.next-episode-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.next-episode-choice {
+  min-height: 120px;
+  padding: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.05);
+  color: #fff;
+  cursor: pointer;
+  display: grid;
+  align-content: center;
+  gap: 7px;
+}
+
+.next-episode-choice strong {
+  font-size: 18px;
+}
+
+.next-episode-choice span,
+.next-default-note {
+  opacity: 0.65;
+  font-size: 12px;
+}
+
+.next-default-note {
+  margin: 16px 0 0;
+}
+
+@media (max-width: 700px), (pointer: coarse) {
+  .anime-skip-hud {
+    top: max(10px, env(safe-area-inset-top));
+    right: max(10px, env(safe-area-inset-right));
+  }
+
+  .anime-skip-hud button {
+    padding: 7px 9px;
+  }
+
+  .episode-grid {
+    grid-template-columns: repeat(auto-fill, minmax(70px, 1fr));
+  }
+
+  .next-episode-options {
+    grid-template-columns: 1fr;
+  }
+}
