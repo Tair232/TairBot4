@@ -9,7 +9,7 @@ import unicodedata
 from difflib import SequenceMatcher
 from urllib.parse import urlparse
 
-HELPER_VERSION = "9.27"
+HELPER_VERSION = "9.29"
 
 
 def log(*parts: object) -> None:
@@ -114,13 +114,105 @@ def exact_search_result(extractor: object, title: str, anime_url: str | None):
 
 
 def episode_numbers(anime: object) -> tuple[list, list[int]]:
-    episodes = list(anime.get_episodes() or [])
-    episodes.sort(key=lambda ep: int(getattr(ep, "ordinal", 999999) or 999999))
+    """
+    V9.28:
+    Parse AnimeGo /player/{id} directly before falling back to
+    anime.get_episodes().
+
+    This avoids a bad Movie classification causing a real series to appear
+    as one synthetic episode #1.
+    """
+    episodes = []
+
+    try:
+        from anicli_api.source.animego import Episode
+        from anicli_api.source.parsers.animego_parser import PageEpisode
+
+        anime_id = str(getattr(anime, "id", "") or "").strip()
+
+        if anime_id:
+            response = anime.http.get(
+                f"https://animego.me/player/{anime_id}"
+            )
+            payload = response.json()
+            content = str(
+                ((payload or {}).get("data") or {}).get("content") or ""
+            )
+
+            parsed = PageEpisode(content).parse()
+            raw_episodes = list(parsed.get("episodes") or [])
+            dubbers = dict(parsed.get("dubbers") or {})
+
+            if raw_episodes:
+                for item in raw_episodes:
+                    try:
+                        ordinal = int(item.get("num") or 0)
+                    except Exception:
+                        continue
+
+                    episode_id = str(item.get("id") or "").strip()
+
+                    if ordinal <= 0 or not episode_id:
+                        continue
+
+                    episodes.append(
+                        Episode(
+                            dubbers=dubbers,
+                            ordinal=ordinal,
+                            title=str(
+                                item.get("title") or f"Серия {ordinal}"
+                            ),
+                            id=episode_id,
+                            videos=[],
+                            **anime._kwargs_http,
+                        )
+                    )
+
+                log(
+                    "episodes direct",
+                    f"id={anime_id}",
+                    f"count={len(episodes)}",
+                    "numbers=",
+                    [
+                        int(getattr(ep, "ordinal", 0) or 0)
+                        for ep in episodes[:40]
+                    ],
+                )
+
+    except Exception as exc:
+        log(
+            "episodes direct failed",
+            type(exc).__name__,
+            str(exc),
+        )
+
+    if not episodes:
+        episodes = list(anime.get_episodes() or [])
+
+        log(
+            "episodes fallback",
+            f"count={len(episodes)}",
+            "numbers=",
+            [
+                int(getattr(ep, "ordinal", 0) or 0)
+                for ep in episodes[:40]
+            ],
+        )
+
+    episodes.sort(
+        key=lambda ep: int(
+            getattr(ep, "ordinal", 999999) or 999999
+        )
+    )
+
     numbers = []
+
     for ep in episodes:
         value = int(getattr(ep, "ordinal", 0) or 0)
+
         if value > 0 and value not in numbers:
             numbers.append(value)
+
     return episodes, numbers
 
 
@@ -262,11 +354,20 @@ def resolve_episode(
         return {
             "ok": False,
             "error": f"Серия {episode_number} отсутствует. Доступно: {numbers[:30]}",
+            "episodes": numbers,
+            "episodesCount": len(numbers),
         }
 
     options = kodik_sources(episode)
     if not options:
-        return {"ok": False, "error": f"Для серии {episode_number} нет Kodik-источников."}
+        return {
+            "ok": False,
+            "error": f"Для серии {episode_number} нет Kodik-источников.",
+            "episodes": numbers,
+            "episodesCount": len(numbers),
+            "unavailableEpisode": int(episode_number),
+            "availableDubs": [],
+        }
 
     wanted = normalize(dub_title)
     ranked = sorted(
@@ -284,6 +385,9 @@ def resolve_episode(
         return {
             "ok": False,
             "error": f"Озвучка «{dub_title}» не найдена для серии {episode_number}.",
+            "episodes": numbers,
+            "episodesCount": len(numbers),
+            "unavailableEpisode": int(episode_number),
             "availableDubs": [item["title"] for item in options],
         }
 
