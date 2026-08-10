@@ -255,23 +255,59 @@ function createOpaqueBrowserToken(bytes = 32) {
   return randomBytes(bytes).toString("base64url");
 }
 
-function browserPublicBaseUrl(socket = null) {
-  if (PUBLIC_BASE_URL) {
-    return PUBLIC_BASE_URL;
+function normalizeBrowserPublicBaseUrl(raw) {
+  let value = String(raw || "")
+    .trim()
+    .replace(/\/+$/, "");
+
+  if (!value) return "";
+
+  // Never pass a WebSocket URL to Discord openExternalLink.
+  if (/^wss:\/\//i.test(value)) {
+    value = `https://${value.slice("wss://".length)}`;
+  } else if (/^ws:\/\//i.test(value)) {
+    value = `https://${value.slice("ws://".length)}`;
+  } else if (!/^https?:\/\//i.test(value)) {
+    value = `https://${value}`;
   }
 
-  // Best-effort fallback for hosts that preserve their own public hostname.
+  let parsed;
+
+  try {
+    parsed = new URL(value);
+  } catch {
+    return "";
+  }
+
+  // Browser handoff is public web navigation, not Socket.IO transport.
+  // Production Movie Night must always use HTTPS here.
+  parsed.protocol = "https:";
+  parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+  parsed.search = "";
+  parsed.hash = "";
+
+  return parsed.toString().replace(/\/$/, "");
+}
+
+function browserPublicBaseUrl(socket = null) {
+  const configured =
+    normalizeBrowserPublicBaseUrl(
+      PUBLIC_BASE_URL
+    );
+
+  if (configured) {
+    return configured;
+  }
+
+  // Socket.IO may report x-forwarded-proto as "ws" / "wss".
+  // Only borrow the HOST from the handshake; the external page itself
+  // is always opened over HTTPS.
   const headers = socket?.handshake?.headers || {};
+
   const forwardedHost = String(
     headers["x-forwarded-host"] ||
     headers.host ||
     ""
-  )
-    .split(",")[0]
-    .trim();
-
-  const forwardedProto = String(
-    headers["x-forwarded-proto"] || "https"
   )
     .split(",")[0]
     .trim();
@@ -281,7 +317,9 @@ function browserPublicBaseUrl(socket = null) {
     !/discord(?:says)?\.com$/i.test(forwardedHost) &&
     !/discord(?:says)?\.com:/i.test(forwardedHost)
   ) {
-    return `${forwardedProto || "https"}://${forwardedHost}`;
+    return normalizeBrowserPublicBaseUrl(
+      `https://${forwardedHost}`
+    );
   }
 
   return "";
@@ -4088,6 +4126,17 @@ io.on("connection", (socket) => {
         const url =
           `${baseUrl}/watch?t=` +
           encodeURIComponent(ticket);
+
+        if (!/^https:\/\//i.test(url)) {
+          throw new Error(
+            "Browser URL должен использовать HTTPS."
+          );
+        }
+
+        console.log(
+          `🌐 Browser ticket: ${user.global_name || user.username} -> ` +
+          `${baseUrl}/watch`
+        );
 
         ack({
           ok: true,
