@@ -308,10 +308,69 @@ input {
 }
 
 .volume-slider {
+  --volume-pct: 100%;
   width: 118px;
-  accent-color: #fff;
+  height: 20px;
+  margin: 0;
+  padding: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
   cursor: pointer;
+  box-sizing: border-box;
 }
+
+.volume-slider::-webkit-slider-runnable-track {
+  width: 100%;
+  height: 4px;
+  border: 0;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    rgba(255,255,255,.96) 0,
+    rgba(255,255,255,.96) var(--volume-pct),
+    rgba(255,255,255,.30) var(--volume-pct),
+    rgba(255,255,255,.30) 100%
+  );
+}
+
+.volume-slider::-webkit-slider-thumb {
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: none;
+}
+
+.volume-slider::-moz-range-track {
+  width: 100%;
+  height: 4px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255,255,255,.30);
+}
+
+.volume-slider::-moz-range-progress {
+  height: 4px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255,255,255,.96);
+}
+
+.volume-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: 0;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: none;
+}
+
+.volume-slider:focus { outline: none; }
 
 .volume-value {
   min-width: 38px;
@@ -1026,42 +1085,51 @@ input:focus {
    Anime uses the same native video surface as movies. */
 
 
-/* V9.27 anime episode + skip voting */
+/* V9.30 real OP/ED majority controls */
 .anime-skip-hud {
   position: absolute;
-  top: max(16px, env(safe-area-inset-top));
-  right: max(16px, env(safe-area-inset-right));
-  z-index: 18;
+  left: calc(14px + var(--sail));
+  bottom: calc(72px + var(--saib));
+  z-index: 30;
   display: flex;
   gap: 8px;
+  opacity: 0;
+  transform: translateY(6px);
+  pointer-events: none;
+  transition: opacity .16s ease, transform .16s ease;
+}
+
+.anime-skip-hud[hidden] { display: none !important; }
+
+.anime-skip-hud.visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
 }
 
 .anime-skip-hud button {
-  border: 1px solid rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(255,255,255,.18);
   border-radius: 999px;
-  padding: 8px 12px;
-  background: rgba(8, 10, 16, 0.72);
+  padding: 9px 13px;
+  background: rgba(8,10,16,.72);
   color: #fff;
   font: inherit;
   font-size: 12px;
+  font-weight: 700;
   cursor: pointer;
-  backdrop-filter: blur(10px);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 10px 36px rgba(0,0,0,.28);
 }
+
+.anime-skip-hud button[hidden] { display: none !important; }
 
 .anime-skip-hud button.selected {
-  border-color: rgba(255, 255, 255, 0.65);
-  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255,255,255,.65);
+  background: rgba(255,255,255,.16);
 }
 
-.anime-skip-hud button:disabled {
-  opacity: 0.38;
-  cursor: default;
-}
-
-.anime-skip-hud span {
-  opacity: 0.72;
-  margin-left: 4px;
-}
+.anime-skip-hud button:disabled { opacity: .42; cursor: default; }
+.anime-skip-hud span { opacity: .72; margin-left: 4px; }
 
 .episode-vote-panel {
   max-width: 900px;
@@ -1154,12 +1222,14 @@ input:focus {
 
 @media (max-width: 700px), (pointer: coarse) {
   .anime-skip-hud {
-    top: max(10px, env(safe-area-inset-top));
-    right: max(10px, env(safe-area-inset-right));
+    left: calc(10px + var(--sail));
+    right: auto;
+    bottom: calc(72px + var(--saib));
   }
 
   .anime-skip-hud button {
-    padding: 7px 9px;
+    min-height: 40px;
+    padding: 8px 11px;
   }
 
   .episode-grid {
