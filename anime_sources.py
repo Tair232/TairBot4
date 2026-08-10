@@ -9,7 +9,7 @@ import unicodedata
 from difflib import SequenceMatcher
 from urllib.parse import urlparse
 
-HELPER_VERSION = "9.30"
+HELPER_VERSION = "9.32"
 
 
 def log(*parts: object) -> None:
@@ -81,6 +81,98 @@ def canonical_kodik_url(url: object) -> str | None:
         return result
     except Exception:
         return None
+
+
+
+def exact_animego_id(anime_url: object) -> str | None:
+    """
+    AnimeGo search URLs end with the actual catalogue id:
+      /anime/eksperimenty-leyn-1114
+      /anime/vanpanchmen-2-2026-02-19-12
+
+    anicli-api PageAnime currently uses a broad regex that can accidentally
+    capture an earlier numeric fragment (e.g. 2026 from a date-like slug).
+    Always trust the FINAL numeric suffix of the exact search URL instead.
+    """
+    try:
+        parsed = urlparse(str(anime_url or "").strip())
+        path = (parsed.path or "").rstrip("/")
+        match = re.search(r"-(\d+)$", path)
+
+        if not match:
+            return None
+
+        value = match.group(1)
+        return value if value.isdigit() else None
+    except Exception:
+        return None
+
+
+def pin_exact_anime_identity(
+    anime: object,
+    selected_title: str,
+    anime_url: str,
+) -> object:
+    exact_id = exact_animego_id(anime_url)
+
+    if not exact_id:
+        raise RuntimeError(
+            f"Не удалось определить AnimeGo ID из exact URL: {anime_url}"
+        )
+
+    parsed_id = str(getattr(anime, "id", "") or "").strip()
+
+    if parsed_id != exact_id:
+        log(
+            "exact id override",
+            f"parsed={parsed_id or '-'}",
+            f"url_id={exact_id}",
+            f"url={anime_url}",
+        )
+
+        try:
+            anime.id = exact_id
+        except Exception as exc:
+            raise RuntimeError(
+                f"Не удалось закрепить exact AnimeGo ID {exact_id}: {exc}"
+            ) from exc
+    else:
+        log(
+            "exact id verified",
+            f"id={exact_id}",
+            f"url={anime_url}",
+        )
+
+    actual_title = str(
+        getattr(anime, "title", "") or ""
+    ).strip()
+
+    selected_title = str(selected_title or "").strip()
+
+    if selected_title and actual_title:
+        score = similarity(
+            selected_title,
+            actual_title,
+        )
+
+        log(
+            "exact title verify",
+            repr(selected_title),
+            "vs",
+            repr(actual_title),
+            f"score={score:.3f}",
+        )
+
+        # Exact URL should never resolve to a completely different title.
+        # Reject instead of silently playing unrelated content.
+        if score < 0.48:
+            raise RuntimeError(
+                "AnimeGo exact URL вернул другой тайтл: "
+                f"выбрано «{selected_title}», "
+                f"страница «{actual_title}»."
+            )
+
+    return anime
 
 
 def exact_search_result(extractor: object, title: str, anime_url: str | None):
@@ -299,6 +391,11 @@ def discover_dubs(extractor: object, title: str, anime_url: str | None) -> dict:
         return {"ok": False, "error": "AnimeGo не нашёл выбранный тайтл.", "options": []}
 
     anime = result.get_anime()
+    anime = pin_exact_anime_identity(
+        anime,
+        title,
+        str(getattr(result, "url", "") or anime_url or ""),
+    )
     episodes, numbers = episode_numbers(anime)
     if not episodes:
         return {"ok": False, "error": "У выбранного тайтла AnimeGo не вернул серии.", "options": []}
@@ -360,6 +457,11 @@ def resolve_episode(
         return {"ok": False, "error": "AnimeGo не нашёл выбранный сезон."}
 
     anime = result.get_anime()
+    anime = pin_exact_anime_identity(
+        anime,
+        title,
+        str(getattr(result, "url", "") or anime_url or ""),
+    )
     episodes, numbers = episode_numbers(anime)
     episode = next(
         (
