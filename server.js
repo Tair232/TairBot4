@@ -88,7 +88,18 @@ const LATE_JOIN_PRELOAD_SECONDS = Math.max(
     MOVIE_PRELOAD_SECONDS + 120
 );
 const PORT = Number(process.env.PORT || process.env.SERVER_PORT) || 3000;
-const REQUIRED_CLIENT_BUILD = "9.30";
+const REQUIRED_CLIENT_BUILD = "9.33";
+
+const PUBLIC_BASE_URL = String(
+  process.env.PUBLIC_BASE_URL ||
+  process.env.BROWSER_PUBLIC_URL ||
+  ""
+)
+  .trim()
+  .replace(/\/+$/, "");
+
+const BROWSER_TICKET_TTL_MS = 60_000;
+const BROWSER_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 
 function requireConfig() {
   const missing = [];
@@ -220,6 +231,92 @@ const playbackReports = new Map();
 // The client only receives opaque result keys; Kodik links stay authoritative
 // on the backend until a proposal is accepted.
 const animeSearchCache = new Map();
+
+const browserTickets = new Map();
+const browserSessions = new Map();
+
+function cleanupBrowserAuth() {
+  const now = Date.now();
+
+  for (const [token, item] of browserTickets) {
+    if (!item || item.expiresAt <= now) {
+      browserTickets.delete(token);
+    }
+  }
+
+  for (const [token, item] of browserSessions) {
+    if (!item || item.expiresAt <= now) {
+      browserSessions.delete(token);
+    }
+  }
+}
+
+function createOpaqueBrowserToken(bytes = 32) {
+  return randomBytes(bytes).toString("base64url");
+}
+
+function browserPublicBaseUrl(socket = null) {
+  if (PUBLIC_BASE_URL) {
+    return PUBLIC_BASE_URL;
+  }
+
+  // Best-effort fallback for hosts that preserve their own public hostname.
+  const headers = socket?.handshake?.headers || {};
+  const forwardedHost = String(
+    headers["x-forwarded-host"] ||
+    headers.host ||
+    ""
+  )
+    .split(",")[0]
+    .trim();
+
+  const forwardedProto = String(
+    headers["x-forwarded-proto"] || "https"
+  )
+    .split(",")[0]
+    .trim();
+
+  if (
+    forwardedHost &&
+    !/discord(?:says)?\.com$/i.test(forwardedHost) &&
+    !/discord(?:says)?\.com:/i.test(forwardedHost)
+  ) {
+    return `${forwardedProto || "https"}://${forwardedHost}`;
+  }
+
+  return "";
+}
+
+function isPhoneUserAgent(value) {
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(
+    String(value || "")
+  );
+}
+
+function browserSocketsForUser(userId) {
+  return [...io.sockets.sockets.values()].filter(
+    (candidate) =>
+      candidate.data.sessionKind === "browser" &&
+      candidate.data.user?.id === userId
+  );
+}
+
+function activitySocketsForUser(userId) {
+  return [...io.sockets.sockets.values()].filter(
+    (candidate) =>
+      candidate.data.sessionKind === "activity" &&
+      candidate.data.user?.id === userId
+  );
+}
+
+function notifyBrowserPresence(userId, active) {
+  for (const activitySocket of activitySocketsForUser(userId)) {
+    activitySocket.emit("browser:presence", {
+      active: Boolean(active),
+    });
+  }
+}
+
 const animeMalIdCache = new Map();
 const animeSkipTimesCache = new Map();
 
@@ -3556,6 +3653,70 @@ async function registerMovieCommand() {
   }
 }
 
+
+app.post("/api/browser-session", (req, res) => {
+  cleanupBrowserAuth();
+
+  const ticket = String(
+    req.body?.ticket || ""
+  ).trim();
+
+  if (!ticket) {
+    res.status(400).json({
+      error: "Нет browser ticket.",
+    });
+    return;
+  }
+
+  const record = browserTickets.get(ticket);
+
+  // Ticket is one-time regardless of whether exchange succeeds afterward.
+  browserTickets.delete(ticket);
+
+  if (!record || record.expiresAt <= Date.now()) {
+    res.status(401).json({
+      error:
+        "Ссылка устарела или уже использована. " +
+        "Открой браузер снова из Discord Activity.",
+    });
+    return;
+  }
+
+  const browserSession =
+    createOpaqueBrowserToken();
+
+  // A fresh handoff invalidates old stored browser session tokens for
+  // this user. Existing sockets are also replaced on connection.
+  for (const [token, session] of browserSessions) {
+    if (session?.user?.id === record.user.id) {
+      browserSessions.delete(token);
+    }
+  }
+
+  browserSessions.set(
+    browserSession,
+    {
+      user: record.user,
+      instanceId: record.instanceId,
+      createdAt: Date.now(),
+      expiresAt:
+        Date.now() + BROWSER_SESSION_TTL_MS,
+    }
+  );
+
+  res.setHeader(
+    "Cache-Control",
+    "no-store, no-cache, must-revalidate"
+  );
+
+  res.json({
+    browser_session: browserSession,
+    user_id: record.user.id,
+    expires_in:
+      Math.floor(BROWSER_SESSION_TTL_MS / 1000),
+  });
+});
+
 app.post("/api/token", async (req, res) => {
   try {
     const code = String(req.body?.code || "");
@@ -3681,19 +3842,74 @@ async function getActivityInstanceForJoiningUser(instanceId, userId) {
 
 io.use(async (socket, next) => {
   try {
-    const accessToken = String(socket.handshake.auth?.accessToken || "");
-    const instanceId = String(socket.handshake.auth?.instanceId || "");
-    const guildId = String(socket.handshake.auth?.guildId || "");
-    const channelId = String(socket.handshake.auth?.channelId || "");
-    const clientBuild = String(socket.handshake.auth?.clientBuild || "");
+    cleanupBrowserAuth();
+
+    const clientBuild = String(
+      socket.handshake.auth?.clientBuild || ""
+    );
 
     if (clientBuild !== REQUIRED_CLIENT_BUILD) {
       throw new Error(
-        `Клиент Activity устарел (${clientBuild || "unknown"}). ` +
-        `Нужна версия ${REQUIRED_CLIENT_BUILD}. ` +
-        "Полностью закрой Activity и открой заново."
+        `Клиент Movie Night устарел (${clientBuild || "unknown"}). ` +
+        `Нужна версия ${REQUIRED_CLIENT_BUILD}.`
       );
     }
+
+    const browserSessionToken = String(
+      socket.handshake.auth?.browserSession || ""
+    ).trim();
+
+    if (browserSessionToken) {
+      const browserSession =
+        browserSessions.get(
+          browserSessionToken
+        );
+
+      if (
+        !browserSession ||
+        browserSession.expiresAt <= Date.now()
+      ) {
+        browserSessions.delete(
+          browserSessionToken
+        );
+
+        throw new Error(
+          "Браузерная сессия истекла. " +
+          "Открой Movie Night снова из Discord Activity."
+        );
+      }
+
+      browserSession.expiresAt =
+        Date.now() +
+        BROWSER_SESSION_TTL_MS;
+
+      socket.data.user =
+        browserSession.user;
+      socket.data.instanceId =
+        browserSession.instanceId;
+      socket.data.clientBuild =
+        clientBuild;
+      socket.data.sessionKind =
+        "browser";
+      socket.data.browserSessionToken =
+        browserSessionToken;
+
+      next();
+      return;
+    }
+
+    const accessToken = String(
+      socket.handshake.auth?.accessToken || ""
+    );
+    const instanceId = String(
+      socket.handshake.auth?.instanceId || ""
+    );
+    const guildId = String(
+      socket.handshake.auth?.guildId || ""
+    );
+    const channelId = String(
+      socket.handshake.auth?.channelId || ""
+    );
 
     if (!accessToken || !instanceId) {
       throw new Error("Нет Activity auth.");
@@ -3704,51 +3920,73 @@ io.use(async (socket, next) => {
     }
 
     if (channelId !== VOICE_CHANNEL_ID) {
-      throw new Error("Activity должна быть открыта в настроенном войсе.");
+      throw new Error(
+        "Activity должна быть открыта в настроенном войсе."
+      );
     }
 
-    const user = await getDiscordUserFromBearer(accessToken);
+    const user =
+      await getDiscordUserFromBearer(
+        accessToken
+      );
 
-    const instance = await getActivityInstanceForJoiningUser(
-      instanceId,
-      user.id
-    );
+    const instance =
+      await getActivityInstanceForJoiningUser(
+        instanceId,
+        user.id
+      );
 
     if (instance.application_id !== CLIENT_ID) {
-      throw new Error("Неверный application instance.");
+      throw new Error(
+        "Неверный application instance."
+      );
     }
 
     if (
       instance.location?.guild_id &&
       instance.location.guild_id !== GUILD_ID
     ) {
-      throw new Error("Неверный instance guild.");
+      throw new Error(
+        "Неверный instance guild."
+      );
     }
 
     if (
       instance.location?.channel_id &&
-      instance.location.channel_id !== VOICE_CHANNEL_ID
+      instance.location.channel_id !==
+        VOICE_CHANNEL_ID
     ) {
-      throw new Error("Неверный instance channel.");
+      throw new Error(
+        "Неверный instance channel."
+      );
     }
 
     if (
       Array.isArray(instance.users) &&
       !instance.users.includes(user.id)
     ) {
-      throw new Error("Пользователь не входит в Activity instance.");
+      throw new Error(
+        "Пользователь не входит в Activity instance."
+      );
     }
 
     socket.data.user = user;
     socket.data.instanceId = instanceId;
     socket.data.clientBuild = clientBuild;
+    socket.data.sessionKind = "activity";
 
     next();
   } catch (error) {
-    console.error("Socket auth denied:", error.message);
+    console.error(
+      "Socket auth denied:",
+      error.message
+    );
+
     next(
       new Error(
-        `Activity session verification failed: ${error.message || "unknown"}`
+        `Movie Night session verification failed: ${
+          error.message || "unknown"
+        }`
       )
     );
   }
@@ -3756,12 +3994,148 @@ io.use(async (socket, next) => {
 
 io.on("connection", (socket) => {
   const user = socket.data.user;
+  const sessionKind =
+    socket.data.sessionKind || "activity";
+
   console.log(
-    `🟢 Activity: ${user.global_name || user.username} (${user.id}) ` +
-    `build=${socket.data.clientBuild || "unknown"}`
+    sessionKind === "browser"
+      ? `🌐 Browser: ${user.global_name || user.username} (${user.id}) ` +
+        `build=${socket.data.clientBuild || "unknown"}`
+      : `🟢 Activity: ${user.global_name || user.username} (${user.id}) ` +
+        `build=${socket.data.clientBuild || "unknown"}`
   );
 
+  if (sessionKind === "browser") {
+    // One live browser player per Discord user.
+    for (const other of browserSocketsForUser(user.id)) {
+      if (other.id !== socket.id) {
+        other.disconnect(true);
+      }
+    }
+
+    for (const activitySocket of activitySocketsForUser(user.id)) {
+      playbackReports.delete(
+        activitySocket.id
+      );
+    }
+
+    notifyBrowserPresence(
+      user.id,
+      true
+    );
+  } else if (
+    browserSocketsForUser(user.id).length
+  ) {
+    socket.emit("browser:presence", {
+      active: true,
+    });
+  }
+
   socket.emit("session:state", sanitizeStateFor(user.id));
+
+  socket.on(
+    "browser:create-ticket",
+    (_payload = {}, ack = () => {}) => {
+      try {
+        if (
+          socket.data.sessionKind !== "activity"
+        ) {
+          throw new Error(
+            "Browser ticket создаётся только из Discord Activity."
+          );
+        }
+
+        if (
+          isPhoneUserAgent(
+            socket.handshake.headers[
+              "user-agent"
+            ]
+          )
+        ) {
+          throw new Error(
+            "Браузерный режим отключён на телефонах."
+          );
+        }
+
+        const baseUrl =
+          browserPublicBaseUrl(socket);
+
+        if (!baseUrl) {
+          throw new Error(
+            "Не задан PUBLIC_BASE_URL. " +
+            "Добавь публичный HTTPS-адрес Bothost в переменные окружения."
+          );
+        }
+
+        cleanupBrowserAuth();
+
+        const ticket =
+          createOpaqueBrowserToken();
+
+        browserTickets.set(
+          ticket,
+          {
+            user,
+            instanceId:
+              socket.data.instanceId,
+            createdAt: Date.now(),
+            expiresAt:
+              Date.now() +
+              BROWSER_TICKET_TTL_MS,
+          }
+        );
+
+        const url =
+          `${baseUrl}/watch?t=` +
+          encodeURIComponent(ticket);
+
+        ack({
+          ok: true,
+          url,
+          expiresIn:
+            Math.floor(
+              BROWSER_TICKET_TTL_MS /
+              1000
+            ),
+        });
+      } catch (error) {
+        ack({
+          ok: false,
+          error:
+            error?.message ||
+            String(error),
+        });
+      }
+    }
+  );
+
+  socket.on(
+    "browser:delegated",
+    () => {
+      if (
+        socket.data.sessionKind !==
+        "activity"
+      ) {
+        return;
+      }
+
+      const previous =
+        playbackReports.get(
+          socket.id
+        );
+
+      if (previous) {
+        playbackReports.set(
+          socket.id,
+          {
+            ...previous,
+            participating: false,
+            lastReportAt: Date.now(),
+          }
+        );
+      }
+    }
+  );
 
   // NTP-like lightweight clock sync. Client measures RTT and computes
   // server clock offset from the midpoint of the request.
@@ -4204,6 +4578,31 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     playbackReports.delete(socket.id);
     animeSearchCache.delete(socket.id);
+
+    if (
+      socket.data.sessionKind ===
+      "browser"
+    ) {
+      console.log(
+        `🌐 Browser закрыт: ${user.global_name || user.username} (${user.id})`
+      );
+
+      setTimeout(() => {
+        if (
+          !browserSocketsForUser(
+            user.id
+          ).length
+        ) {
+          notifyBrowserPresence(
+            user.id,
+            false
+          );
+        }
+      }, 1500);
+
+      return;
+    }
+
     console.log(
       `🔴 Activity ушёл: ${user.global_name || user.username} (${user.id})`
     );
