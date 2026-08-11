@@ -88,7 +88,7 @@ const LATE_JOIN_PRELOAD_SECONDS = Math.max(
     MOVIE_PRELOAD_SECONDS + 120
 );
 const PORT = Number(process.env.PORT || process.env.SERVER_PORT) || 3000;
-const REQUIRED_CLIENT_BUILD = "9.33";
+const REQUIRED_CLIENT_BUILD = "9.35";
 
 const PUBLIC_BASE_URL = String(
   process.env.PUBLIC_BASE_URL ||
@@ -144,6 +144,7 @@ const defaultState = () => ({
   voteEndsAt: null,
   suggestions: [],
   votes: {},
+  earlyFinishVotes: {},
 
   dubVoteEndsAt: null,
   animeWinner: null,
@@ -185,6 +186,9 @@ function normalizeState(raw) {
 
   if (!Array.isArray(state.suggestions)) state.suggestions = [];
   if (!state.votes || typeof state.votes !== "object") state.votes = {};
+  if (!state.earlyFinishVotes || typeof state.earlyFinishVotes !== "object") {
+    state.earlyFinishVotes = {};
+  }
 
   if (!Array.isArray(state.dubOptions)) state.dubOptions = [];
   if (!state.dubVotes || typeof state.dubVotes !== "object") {
@@ -854,6 +858,17 @@ function skipMajorityThreshold() {
   return Math.max(1, Math.floor(viewers / 2) + 1);
 }
 
+function activeEarlyFinishVoteCount() {
+  const active = connectedActivityUserIds();
+  let count = 0;
+
+  for (const userId of Object.keys(state.earlyFinishVotes || {})) {
+    if (active.has(userId)) count += 1;
+  }
+
+  return count;
+}
+
 function sanitizeStateFor(userId) {
   const counts = new Map();
 
@@ -928,6 +943,15 @@ function sanitizeStateFor(userId) {
     suggestions,
     mySuggestionId: mySuggestion?.id || null,
     myVote: state.votes[userId] || null,
+    earlyFinishVote: state.phase === "VOTING"
+      ? {
+          votes: activeEarlyFinishVoteCount(),
+          threshold: majority,
+          viewers: connectedActivityUserIds().size,
+          mine: Boolean(state.earlyFinishVotes?.[userId]),
+          enabled: state.suggestions.length > 0,
+        }
+      : null,
 
     dubVoteEndsAt: state.dubVoteEndsAt,
     animeWinner: state.animeWinner
@@ -2722,6 +2746,7 @@ async function startVoting() {
     voteEndsAt: Date.now() + VOTING_DURATION_SECONDS * 1000,
     suggestions: [],
     votes: {},
+    earlyFinishVotes: {},
   };
 
   saveState();
@@ -4498,6 +4523,81 @@ io.on("connection", (socket) => {
       ack({ ok: false, error: error.message });
     }
   });
+
+
+  socket.on(
+    "vote:finish-early",
+    async (_payload = {}, ack = () => {}) => {
+      try {
+        if (state.phase !== "VOTING") {
+          throw new Error("Сейчас нет основного голосования.");
+        }
+
+        if (!state.suggestions.length) {
+          throw new Error(
+            "Сначала нужно предложить хотя бы один фильм или аниме."
+          );
+        }
+
+        if (state.earlyFinishVotes?.[user.id]) {
+          delete state.earlyFinishVotes[user.id];
+        } else {
+          state.earlyFinishVotes[user.id] = true;
+        }
+
+        const votes = activeEarlyFinishVoteCount();
+        const threshold = skipMajorityThreshold();
+        const mine = Boolean(state.earlyFinishVotes?.[user.id]);
+
+        console.log(
+          `⏩ Early vote finish: ${user.global_name || user.username} ` +
+          `${mine ? "YES" : "CANCEL"} · ${votes}/${threshold}`
+        );
+
+        if (votes < threshold) {
+          saveState();
+          broadcastState();
+
+          ack({
+            ok: true,
+            passed: false,
+            votes,
+            threshold,
+            mine,
+          });
+          return;
+        }
+
+        // Majority is ready: finish the current 10-minute vote immediately.
+        // Existing winner rules stay unchanged: most votes, then earliest
+        // proposal on a tie.
+        state.voteEndsAt = null;
+        saveState();
+        broadcastState();
+
+        console.log(
+          `⏩ Main voting finished early by majority ${votes}/${threshold}.`
+        );
+
+        const winner = await finishVoting({
+          extendIfEmpty: false,
+        });
+
+        ack({
+          ok: true,
+          passed: true,
+          votes,
+          threshold,
+          winnerTitle: winner?.title || null,
+        });
+      } catch (error) {
+        ack({
+          ok: false,
+          error: error?.message || String(error),
+        });
+      }
+    }
+  );
 
 
   socket.on(
