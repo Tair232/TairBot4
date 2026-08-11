@@ -3,7 +3,7 @@ import { io } from "socket.io-client";
 import Hls from "hls.js";
 import "./style.css";
 
-const CLIENT_BUILD = "9.33";
+const CLIENT_BUILD = "9.35";
 
 const CLIENT_ID = "1535948196663009321";
 const ALLOWED_GUILD_ID = "1492151172570808390";
@@ -3093,6 +3093,47 @@ function renderVoting(state) {
               }
             </div>
 
+            <div class="early-finish-vote">
+              <div class="early-finish-copy">
+                <strong>Все уже готовы?</strong>
+                <span>
+                  Большинство может закончить 10-минутное голосование досрочно.
+                </span>
+              </div>
+
+              <button
+                id="earlyFinishVoteButton"
+                class="early-finish-button ${
+                  state.earlyFinishVote?.mine
+                    ? "selected"
+                    : ""
+                }"
+                type="button"
+                ${
+                  state.earlyFinishVote?.enabled === false
+                    ? "disabled"
+                    : ""
+                }
+              >
+                <span>⏩ Закончить голосование</span>
+                <b>
+                  ${Number(state.earlyFinishVote?.votes) || 0}/${
+                    Number(state.earlyFinishVote?.threshold) || 1
+                  }
+                </b>
+              </button>
+
+              <small class="early-finish-hint">
+                ${
+                  state.earlyFinishVote?.enabled === false
+                    ? "Сначала кто-нибудь должен предложить вариант."
+                    : state.earlyFinishVote?.mine
+                      ? "Твой голос учтён. Нажми ещё раз, чтобы отменить."
+                      : "Нужно больше половины активных участников."
+                }
+              </small>
+            </div>
+
             <div id="voteError" class="form-error"></div>
           </section>
         </div>
@@ -3306,6 +3347,36 @@ function renderVoting(state) {
         );
       };
     });
+
+  const earlyFinishButton =
+    document.querySelector("#earlyFinishVoteButton");
+
+  if (earlyFinishButton) {
+    earlyFinishButton.onclick = () => {
+      const errorBox =
+        document.querySelector("#voteError");
+
+      if (errorBox) errorBox.textContent = "";
+
+      earlyFinishButton.disabled = true;
+
+      socket.emit(
+        "vote:finish-early",
+        {},
+        (result) => {
+          if (!result?.ok) {
+            earlyFinishButton.disabled = false;
+
+            if (errorBox) {
+              errorBox.textContent =
+                result?.error ||
+                "Не удалось проголосовать за досрочное завершение.";
+            }
+          }
+        }
+      );
+    };
+  }
 }
 
 function remainingDubVotingSeconds(state) {
