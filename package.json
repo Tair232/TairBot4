@@ -1,7 +1,7 @@
 {
-  "name": "movie-night-v9-34-browser-https-fix",
+  "name": "movie-night-v9-35-early-finish-vote",
   "private": true,
-  "version": "2.0.34",
+  "version": "2.0.35",
   "type": "module",
   "scripts": {
     "build": "vite build",
